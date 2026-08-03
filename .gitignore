@@ -1,0 +1,39 @@
+# macOS 与编辑器
+.DS_Store
+.claude/
+.codex/
+.qoder/
+
+# 依赖与构建产物
+node_modules/
+frontend/dist/
+src-tauri/target/
+src-tauri/gen/
+.venv/
+__pycache__/
+*.py[cod]
+
+# 发行包与二进制输入
+release-assets/
+*.app
+*.dmg
+*.pdf
+
+# 本地运行数据
+Books/
+ImportTasks/
+Data/
+Backups/
+tmp/
+
+# 生成书籍及其一次性制作工具
+sample-books/
+site/
+tools/
+scripts/apply-rust-figure-images.mjs
+scripts/check-rust-figures.mjs
+scripts/convert-rust-for-dummies.mjs
+
+# 设计过程稿；应用使用的正式图标位于 src-tauri/icons
+design/
+design-system/
