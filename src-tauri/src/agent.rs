@@ -130,6 +130,7 @@ impl AgentCoordinator {
     pub fn new(tasks_dir: PathBuf, database: Arc<Database>) -> Result<Self> {
         fs::create_dir_all(&tasks_dir)
             .with_context(|| format!("无法创建 Agent 任务目录 {}", tasks_dir.display()))?;
+        database.reset_interrupted_agent_tasks()?;
         let (task_updates, _) = broadcast::channel(256);
         Ok(Self {
             tasks_dir,

@@ -513,6 +513,19 @@ impl Database {
             .context("读取活跃 Agent 任务失败")
     }
 
+    pub fn reset_interrupted_agent_tasks(&self) -> Result<()> {
+        let connection = self.connection.lock();
+        connection.execute(
+            "UPDATE agent_tasks
+             SET status = 'paused',
+                 error = '应用上次退出时任务仍在运行，已转为暂停，可切换运行时后重试',
+                 updated_at = ?1
+             WHERE status IN ('running', 'queued')",
+            params![Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
     pub fn ai_messages(&self, book_id: &str) -> Result<Vec<AiMessage>> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
