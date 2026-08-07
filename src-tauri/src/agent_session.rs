@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
+use parking_lot::Mutex;
 use uuid::Uuid;
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(60 * 30);
@@ -146,6 +147,10 @@ impl ExecutionControl {
     pub fn cancel(&self) {
         let _ = self.cancel.send(true);
     }
+
+    pub fn pid(&self) -> u32 {
+        self.pid.load(Ordering::Relaxed)
+    }
 }
 
 pub struct ExecutionRun {
@@ -196,7 +201,7 @@ impl AgentSessionHost {
         control: ExecutionControl,
     ) -> ExecutionRun {
         let slot = {
-            let mut sessions = self.sessions.lock().expect("Agent 会话表锁");
+            let mut sessions = self.sessions.lock();
             sessions
                 .entry(config.key.clone())
                 .or_insert_with(|| {
@@ -280,7 +285,7 @@ impl AgentSessionHost {
 
     pub async fn dispose_book(&self, book_id: &str) {
         let slots = {
-            let mut sessions = self.sessions.lock().expect("Agent 会话表锁");
+            let mut sessions = self.sessions.lock();
             let keys = sessions
                 .keys()
                 .filter(|key| key.book_id == book_id)
@@ -327,7 +332,7 @@ impl EventEmitter {
     }
 
     fn emit(&self, build: impl FnOnce(EventScope) -> ProviderExecutionEvent) {
-        let mut sequence = self.sequence.lock().expect("Agent 事件序号锁");
+        let mut sequence = self.sequence.lock();
         *sequence += 1;
         let event = build(EventScope {
             session_instance_id: self.session_instance_id.clone(),
@@ -1066,7 +1071,6 @@ impl NativeProcess {
                     Ok(0) | Err(_) => break,
                     Ok(read) => stderr_for_task
                         .lock()
-                        .expect("Agent stderr 锁")
                         .extend_from_slice(&buffer[..read]),
                 }
             }
@@ -1085,15 +1089,22 @@ impl NativeProcess {
     }
 
     fn stderr(&self) -> String {
-        String::from_utf8_lossy(&self.stderr.lock().expect("Agent stderr 锁"))
+        String::from_utf8_lossy(&self.stderr.lock())
             .trim()
             .to_string()
     }
 
     async fn terminate(&mut self) {
-        terminate_process_group(self.pid);
-        let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
-        let _ = self.child.kill().await;
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.pid as i32), libc::SIGTERM);
+        }
+        if tokio::time::timeout(Duration::from_secs(2), self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.child.kill().await;
+        }
     }
 }
 
@@ -1229,14 +1240,26 @@ fn classify_error(error: &anyhow::Error) -> String {
     .to_string()
 }
 
-fn terminate_process_group(pid: u32) {
+pub(crate) fn terminate_process_group(pid: u32) {
     if pid == 0 {
         return;
     }
     #[cfg(unix)]
     unsafe {
         libc::kill(-(pid as i32), libc::SIGTERM);
+        // 给运行时最多两秒响应 SIGTERM（刷写会话状态）；进程组一退出就返回，
+        // 避免对会自行终止的子进程（含测试用的脚本）空等满两秒。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if libc::kill(-(pid as i32), 0) != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        libc::kill(-(pid as i32), libc::SIGKILL);
     }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 #[cfg(test)]

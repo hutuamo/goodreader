@@ -724,8 +724,20 @@ async fn stream_agent_task_events(
         .map(|task| state.agent.decorate_task(task))
         .ok_or_else(|| ApiError::not_found("Agent 任务不存在"))?;
     let requested_task_id = task_id.clone();
+    let database = state.database.clone();
+    let agent = state.agent.clone();
     let updates = BroadcastStream::new(task_updates).filter_map(move |result| match result {
         Ok(event) if event.task_id() == requested_task_id => Some(event),
+        Err(_) => {
+            // 消费慢导致 broadcast 溢出时重发最新快照，避免运行→完成等关键事件
+            // 丢失后前端停在“运行中”假状态；前端按 sequence 去重，可安全自愈。
+            database
+                .agent_task(&requested_task_id)
+                .ok()
+                .flatten()
+                .map(|task| agent.decorate_task(task))
+                .map(|task| AgentTaskStreamEvent::Snapshot { task })
+        }
         _ => None,
     });
     let stream = tokio_stream::once(AgentTaskStreamEvent::Snapshot { task: current })
@@ -925,6 +937,7 @@ async fn delete_book_package(
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)?;
+    remove_cover_override(&state.cover_overrides_dir, &book_id).map_err(ApiError::internal)?;
 
     let catalog = scan_books(&state.books_dir);
     *state.catalog.write().expect("书库写锁") = catalog;
@@ -1192,9 +1205,10 @@ async fn save_setting(
     if input.value.len() > 256 {
         return Err(ApiError::bad_request("设置值过长"));
     }
+    let value = clamp_setting_value(&key, &input.value)?;
     state
         .database
-        .save_setting(&key, &input.value)
+        .save_setting(&key, &value)
         .map_err(ApiError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1297,6 +1311,20 @@ fn save_cover_override(root: &Path, book_id: &str, source: &Path) -> Result<()> 
     let bytes = fs::read(source).context("无法读取封面图片")?;
     let format =
         cover_image_format(&bytes).context("仅支持 PNG、JPEG、GIF 或 WebP 格式的封面图片")?;
+    // 只读图像头取尺寸（不解码像素，避免巨幅声明尺寸触发内存暴涨），拒绝每边
+    // 超过上限的封面，防止 WebView 解码时冻结。
+    const MAX_COVER_DIMENSION: u32 = 8192;
+    // 合法图像读出头里声明的尺寸（不解码像素，避免巨幅声明触发内存暴涨）。
+    // 无法解析的文件连 WebView 也无法解码，不构成解码 DoS，放行交给 magic-byte 校验。
+    if let Some((width, height)) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok())
+    {
+        if width > MAX_COVER_DIMENSION || height > MAX_COVER_DIMENSION {
+            bail!("封面图片像素过大（每边最多 {MAX_COVER_DIMENSION} 像素）");
+        }
+    }
     fs::create_dir_all(root).context("无法创建封面覆盖目录")?;
     let temporary = root.join(format!("{book_id}.tmp"));
     fs::write(&temporary, bytes).context("无法暂存新封面")?;
@@ -1472,6 +1500,21 @@ fn validate_setting_key(key: &str) -> Result<(), ApiError> {
     } else {
         Err(ApiError::bad_request("不支持的设置项"))
     }
+}
+
+fn clamp_setting_value(key: &str, value: &str) -> Result<String, ApiError> {
+    // 前端已用 parseClampedSetting 防御，这里在后端再钳一道，保证直接调用 API
+    // 或旧前端写入的数值设置始终落在合法区间。
+    let (min, max) = match key {
+        "reader-font-size" => (80_f64, 160_f64),
+        "sidebar-width" => (280_f64, 560_f64),
+        "ai-sidebar-width" => (340_f64, 720_f64),
+        _ => return Ok(value.to_string()),
+    };
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| ApiError::bad_request("设置值需要数值"))?;
+    Ok((parsed.clamp(min, max).round() as i64).to_string())
 }
 
 #[cfg(test)]

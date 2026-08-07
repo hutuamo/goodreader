@@ -1,5 +1,7 @@
 import MarkdownIt from "markdown-it";
 
+import { parseClampedSetting } from "./settings";
+
 type Progress = {
   bookId: string;
   chapterId: string;
@@ -1059,18 +1061,30 @@ function aiTaskHtml(task: AgentTask): string {
   return `<i></i><span><strong>${escapeHtml(phase)}</strong>已运行 ${elapsed} · 关闭侧栏不会停止任务</span><button class="gr-ai-stop" type="button" title="停止当前 AI 请求">${readerIcon("stop")}停止请求</button>`;
 }
 
+let pendingStreamingRender = 0;
+let pendingStreamingTask: AgentTask | null = null;
+
 function updateAiStreamingMessage(task: AgentTask): void {
-  const message = document.querySelector<HTMLElement>("#grAiStreaming");
-  if (!message) return;
-  const body = message.querySelector<HTMLElement>(".gr-ai-message-body");
-  const content = task.partialOutput?.trim() ?? "";
-  message.hidden = !content;
-  if (body && content) body.innerHTML = renderAiContent(content);
-  const timeline = document.querySelector<HTMLElement>("#grAiTimeline");
-  if (timeline && aiViewState.timelineFollowLatest) {
-    timeline.scrollTop = timeline.scrollHeight;
-    rememberAiTimelinePosition(timeline);
-  }
+    // 流式 delta 可能每个 token 触发一次；用 requestAnimationFrame 合并到每帧
+    // 最多一次 markdown 渲染 + innerHTML 重建，避免长回答阻塞主线程。
+    pendingStreamingTask = task;
+    if (pendingStreamingRender) return;
+    pendingStreamingRender = window.requestAnimationFrame(() => {
+        pendingStreamingRender = 0;
+        const current = pendingStreamingTask;
+        if (!current) return;
+        const message = document.querySelector<HTMLElement>("#grAiStreaming");
+        if (!message) return;
+        const body = message.querySelector<HTMLElement>(".gr-ai-message-body");
+        const content = current.partialOutput?.trim() ?? "";
+        message.hidden = !content;
+        if (body && content) body.innerHTML = renderAiContent(content);
+        const timeline = document.querySelector<HTMLElement>("#grAiTimeline");
+        if (timeline && aiViewState.timelineFollowLatest) {
+            timeline.scrollTop = timeline.scrollHeight;
+            rememberAiTimelinePosition(timeline);
+        }
+    });
 }
 
 async function submitAiQuestion(textarea: HTMLTextAreaElement | null, button: HTMLButtonElement): Promise<void> {
@@ -2124,12 +2138,19 @@ async function boot(): Promise<void> {
       aiSendKey = savedAiSendKey;
     }
     topbarPinned = savedTopbarPinned === "true";
-    const parsedFontSize = Number(savedFontSize);
-    if (Number.isFinite(parsedFontSize)) readerFontSize = clampNumber(parsedFontSize, 80, 160);
-    const parsedSidebarWidth = Number(savedSidebarWidth);
-    if (Number.isFinite(parsedSidebarWidth)) sidebarWidth = parsedSidebarWidth;
-    const parsedAiSidebarWidth = Number(savedAiSidebarWidth);
-    if (Number.isFinite(parsedAiSidebarWidth)) aiSidebarWidth = parsedAiSidebarWidth;
+    readerFontSize = parseClampedSetting(savedFontSize, 100, 80, 160);
+    sidebarWidth = parseClampedSetting(
+      savedSidebarWidth,
+      sidebarWidthLimits.toc.default,
+      sidebarWidthLimits.toc.min,
+      sidebarWidthLimits.toc.max,
+    );
+    aiSidebarWidth = parseClampedSetting(
+      savedAiSidebarWidth,
+      sidebarWidthLimits.ai.default,
+      sidebarWidthLimits.ai.min,
+      sidebarWidthLimits.ai.max,
+    );
     aiViewState = restoreAiViewState();
     restoreAiWorkspaceCache();
     applyBookLanguage();

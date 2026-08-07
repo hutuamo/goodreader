@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Local, Utc};
+use parking_lot::Mutex;
 use rusqlite::backup::Backup;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
@@ -17,6 +17,102 @@ use crate::models::{
 const SCHEMA_VERSION: i64 = 3;
 const BACKUP_LIMIT: usize = 7;
 const HIGHLIGHT_COLORS: [&str; 4] = ["yellow", "green", "blue", "pink"];
+
+const BASELINE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS progress (
+    book_id TEXT PRIMARY KEY NOT NULL,
+    chapter_id TEXT NOT NULL,
+    block_id TEXT,
+    chapter_progress REAL NOT NULL CHECK(chapter_progress >= 0 AND chapter_progress <= 1),
+    overall_progress REAL NOT NULL CHECK(overall_progress >= 0 AND overall_progress <= 1),
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS annotations (
+    id TEXT PRIMARY KEY NOT NULL,
+    book_id TEXT NOT NULL,
+    chapter_id TEXT NOT NULL,
+    block_id TEXT NOT NULL,
+    start_offset INTEGER NOT NULL CHECK(start_offset >= 0),
+    end_offset INTEGER NOT NULL CHECK(end_offset > start_offset),
+    quote TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('highlight', 'note', 'bookmark')),
+    color TEXT,
+    note TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS annotation_exact_unique
+ON annotations(book_id, chapter_id, block_id, start_offset, end_offset, kind);
+
+CREATE INDEX IF NOT EXISTS annotation_book_created
+ON annotations(book_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_runtimes (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    executable TEXT NOT NULL,
+    arguments_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    id TEXT PRIMARY KEY NOT NULL,
+    book_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    current_runtime_id TEXT NOT NULL,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS agent_task_book_updated
+ON agent_tasks(book_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_executions (
+    id TEXT PRIMARY KEY NOT NULL,
+    task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+    runtime_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    output TEXT,
+    error TEXT,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ai_messages (
+    id TEXT PRIMARY KEY NOT NULL,
+    book_id TEXT NOT NULL,
+    task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    runtime_id TEXT,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ai_message_book_created
+ON ai_messages(book_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    book_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    provider_session_id TEXT NOT NULL,
+    provider_state_json TEXT NOT NULL DEFAULT '{}',
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(book_id, runtime_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS agent_tasks_one_active_per_book
+    ON agent_tasks(book_id) WHERE status NOT IN ('completed', 'stopped');
+"#;
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -46,112 +142,29 @@ impl Database {
     }
 
     fn initialize(&self) -> Result<()> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > SCHEMA_VERSION {
             bail!("数据库版本 {version} 高于应用支持的 {SCHEMA_VERSION}");
         }
-        connection.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS progress (
-                book_id TEXT PRIMARY KEY NOT NULL,
-                chapter_id TEXT NOT NULL,
-                block_id TEXT,
-                chapter_progress REAL NOT NULL CHECK(chapter_progress >= 0 AND chapter_progress <= 1),
-                overall_progress REAL NOT NULL CHECK(overall_progress >= 0 AND overall_progress <= 1),
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS annotations (
-                id TEXT PRIMARY KEY NOT NULL,
-                book_id TEXT NOT NULL,
-                chapter_id TEXT NOT NULL,
-                block_id TEXT NOT NULL,
-                start_offset INTEGER NOT NULL CHECK(start_offset >= 0),
-                end_offset INTEGER NOT NULL CHECK(end_offset > start_offset),
-                quote TEXT NOT NULL,
-                kind TEXT NOT NULL CHECK(kind IN ('highlight', 'note', 'bookmark')),
-                color TEXT,
-                note TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS annotation_exact_unique
-            ON annotations(book_id, chapter_id, block_id, start_offset, end_offset, kind);
-
-            CREATE INDEX IF NOT EXISTS annotation_book_created
-            ON annotations(book_id, created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY NOT NULL,
-                value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS agent_runtimes (
-                id TEXT PRIMARY KEY NOT NULL,
-                name TEXT NOT NULL,
-                executable TEXT NOT NULL,
-                arguments_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS agent_tasks (
-                id TEXT PRIMARY KEY NOT NULL,
-                book_id TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                status TEXT NOT NULL,
-                goal TEXT NOT NULL,
-                current_runtime_id TEXT NOT NULL,
-                error TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS agent_task_book_updated
-            ON agent_tasks(book_id, updated_at DESC);
-
-            CREATE TABLE IF NOT EXISTS agent_executions (
-                id TEXT PRIMARY KEY NOT NULL,
-                task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
-                runtime_id TEXT NOT NULL,
-                status TEXT NOT NULL,
-                output TEXT,
-                error TEXT,
-                started_at INTEGER NOT NULL,
-                finished_at INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS ai_messages (
-                id TEXT PRIMARY KEY NOT NULL,
-                book_id TEXT NOT NULL,
-                task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
-                role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-                content TEXT NOT NULL,
-                runtime_id TEXT,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS ai_message_book_created
-            ON ai_messages(book_id, created_at ASC);
-
-            CREATE TABLE IF NOT EXISTS agent_sessions (
-                book_id TEXT NOT NULL,
-                runtime_id TEXT NOT NULL,
-                provider_session_id TEXT NOT NULL,
-                provider_state_json TEXT NOT NULL DEFAULT '{}',
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY(book_id, runtime_id)
-            );
-
-            PRAGMA user_version = 3;
-            "#,
-        )?;
+        // 把迁移放进事务，避免中途崩溃留下“部分表已建、user_version 未更新”的中间态。
+        // 基线表与索引用 CREATE IF NOT EXISTS 幂等建立，对任意旧版本库都安全；后续
+        // 破坏性变更（ALTER TABLE 等）按版本阶梯在此追加：
+        //     if version < 4 { transaction.execute_batch("ALTER TABLE ...")?; }
+        // user_version 必须在事务外写入（SQLite 限制）。
+        {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(BASELINE_SCHEMA)?;
+            transaction.commit()?;
+        }
+        if version < SCHEMA_VERSION {
+            connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
         Ok(())
     }
 
     pub fn all_progress(&self) -> Result<Vec<Progress>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT book_id, chapter_id, block_id, chapter_progress, overall_progress, updated_at
              FROM progress",
@@ -162,7 +175,7 @@ impl Database {
     }
 
     pub fn progress(&self, book_id: &str) -> Result<Option<Progress>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection
             .query_row(
                 "SELECT book_id, chapter_id, block_id, chapter_progress, overall_progress, updated_at
@@ -184,7 +197,7 @@ impl Database {
             bail!("章节 ID 不能为空");
         }
         let now = Utc::now().timestamp_millis();
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection.execute(
             r#"
             INSERT INTO progress(
@@ -217,7 +230,7 @@ impl Database {
     }
 
     pub fn annotations(&self, book_id: &str) -> Result<Vec<Annotation>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let mut statement = connection.prepare(
             r#"
             SELECT id, book_id, chapter_id, block_id, start_offset, end_offset, quote,
@@ -234,7 +247,7 @@ impl Database {
 
     pub fn create_annotation(&self, book_id: &str, input: &CreateAnnotation) -> Result<Annotation> {
         validate_annotation(input)?;
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
 
         let exact = connection
             .query_row(
@@ -330,7 +343,7 @@ impl Database {
             bail!("笔记内容不能为空");
         }
         let now = Utc::now().timestamp_millis();
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let changed = connection.execute(
             "UPDATE annotations SET note = ?1, updated_at = ?2
              WHERE id = ?3 AND kind = 'note'",
@@ -353,12 +366,12 @@ impl Database {
     }
 
     pub fn delete_annotation(&self, annotation_id: &str) -> Result<bool> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         Ok(connection.execute("DELETE FROM annotations WHERE id = ?1", [annotation_id])? > 0)
     }
 
     pub fn forget_book(&self, book_id: &str) -> Result<(usize, usize)> {
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let progress = transaction.execute("DELETE FROM progress WHERE book_id = ?1", [book_id])?;
         let annotations =
@@ -370,7 +383,7 @@ impl Database {
     }
 
     pub fn clear_ai_workspace(&self, book_id: &str) -> Result<usize> {
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let removed =
             transaction.execute("DELETE FROM agent_tasks WHERE book_id = ?1", [book_id])?;
@@ -380,7 +393,7 @@ impl Database {
     }
 
     pub fn agent_session(&self, book_id: &str, runtime_id: &str) -> Result<Option<AgentSession>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection
             .query_row(
                 "SELECT book_id, runtime_id, provider_session_id, provider_state_json, updated_at
@@ -408,7 +421,7 @@ impl Database {
         provider_state_json: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp_millis();
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection.execute(
             "INSERT INTO agent_sessions(
                 book_id, runtime_id, provider_session_id, provider_state_json, updated_at
@@ -444,14 +457,22 @@ impl Database {
         let now = Utc::now().timestamp_millis();
         let task_id = Uuid::new_v4().to_string();
         let message_id = Uuid::new_v4().to_string();
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO agent_tasks(
-                id, book_id, kind, status, goal, current_runtime_id, error, created_at, updated_at
-             ) VALUES (?1, ?2, 'question', 'queued', ?3, ?4, NULL, ?5, ?5)",
-            params![task_id, book_id, goal, runtime_id, now],
-        )?;
+        transaction
+            .execute(
+                "INSERT INTO agent_tasks(
+                    id, book_id, kind, status, goal, current_runtime_id, error, created_at, updated_at
+                 ) VALUES (?1, ?2, 'question', 'queued', ?3, ?4, NULL, ?5, ?5)",
+                params![task_id, book_id, goal, runtime_id, now],
+            )
+            .map_err(|error| {
+                if error.to_string().contains("UNIQUE constraint") {
+                    anyhow!("这本书已有正在运行的 AI 请求，请先等待完成或停止当前请求")
+                } else {
+                    anyhow::Error::from(error)
+                }
+            })?;
         transaction.execute(
             "INSERT INTO ai_messages(
                 id, book_id, task_id, role, content, runtime_id, created_at
@@ -465,7 +486,7 @@ impl Database {
     }
 
     pub fn agent_task(&self, task_id: &str) -> Result<Option<AgentTask>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection
             .query_row(
                 "SELECT id, book_id, kind, status, goal, current_runtime_id, error,
@@ -479,7 +500,7 @@ impl Database {
     }
 
     pub fn active_agent_tasks(&self, book_id: &str) -> Result<Vec<AgentTask>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT id, book_id, kind, status, goal, current_runtime_id, error,
                     created_at, updated_at
@@ -492,8 +513,21 @@ impl Database {
             .context("读取活跃 Agent 任务失败")
     }
 
+    pub fn reset_interrupted_agent_tasks(&self) -> Result<()> {
+        let connection = self.connection.lock();
+        connection.execute(
+            "UPDATE agent_tasks
+             SET status = 'paused',
+                 error = '应用上次退出时任务仍在运行，已转为暂停，可切换运行时后重试',
+                 updated_at = ?1
+             WHERE status IN ('running', 'queued')",
+            params![Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
     pub fn ai_messages(&self, book_id: &str) -> Result<Vec<AiMessage>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT messages.id, messages.book_id, messages.task_id, messages.role,
                     messages.content, messages.runtime_id, messages.created_at,
@@ -515,7 +549,7 @@ impl Database {
     pub fn start_agent_execution(&self, task_id: &str, runtime_id: &str) -> Result<String> {
         let now = Utc::now().timestamp_millis();
         let execution_id = Uuid::new_v4().to_string();
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
             "UPDATE agent_tasks
@@ -549,7 +583,7 @@ impl Database {
         }
         let now = Utc::now().timestamp_millis();
         let message_id = Uuid::new_v4().to_string();
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
             "UPDATE agent_tasks SET status = 'completed', error = NULL, updated_at = ?1
@@ -585,7 +619,7 @@ impl Database {
         error: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp_millis();
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         if let Some(execution_id) = execution_id {
             transaction.execute(
@@ -606,7 +640,7 @@ impl Database {
 
     pub fn stop_agent_task(&self, task_id: &str) -> Result<AgentTask> {
         let now = Utc::now().timestamp_millis();
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         transaction.execute(
             "UPDATE agent_executions
@@ -632,7 +666,7 @@ impl Database {
 
     pub fn retry_agent_task(&self, task_id: &str, runtime_id: &str) -> Result<AgentTask> {
         let now = Utc::now().timestamp_millis();
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let changed = connection.execute(
             "UPDATE agent_tasks
              SET status = 'queued', current_runtime_id = ?1, error = NULL, updated_at = ?2
@@ -667,7 +701,7 @@ impl Database {
         let id = format!("custom-{}", Uuid::new_v4());
         let now = Utc::now().timestamp_millis();
         let arguments_json = serde_json::to_string(arguments)?;
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection.execute(
             "INSERT INTO agent_runtimes(id, name, executable, arguments_json, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -682,7 +716,7 @@ impl Database {
     }
 
     pub fn custom_agent_runtimes(&self) -> Result<Vec<CustomAgentRuntime>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT id, name, executable, arguments_json
              FROM agent_runtimes ORDER BY created_at ASC",
@@ -702,12 +736,12 @@ impl Database {
     }
 
     pub fn delete_custom_agent_runtime(&self, runtime_id: &str) -> Result<bool> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         Ok(connection.execute("DELETE FROM agent_runtimes WHERE id = ?1", [runtime_id])? > 0)
     }
 
     pub fn annotation_count(&self, book_id: &str) -> Result<usize> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let count: i64 = connection.query_row(
             "SELECT COUNT(*) FROM annotations WHERE book_id = ?1",
             [book_id],
@@ -717,7 +751,7 @@ impl Database {
     }
 
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection
             .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
                 row.get(0)
@@ -727,7 +761,7 @@ impl Database {
     }
 
     pub fn save_setting(&self, key: &str, value: &str) -> Result<()> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection.execute(
             "INSERT INTO settings(key, value) VALUES(?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -740,7 +774,7 @@ impl Database {
         let timestamp = Local::now().format("%Y%m%d-%H%M%S");
         let name = format!("{kind}-{timestamp}.sqlite3");
         let path = self.backups_dir.join(&name);
-        let source = self.connection.lock().expect("数据库互斥锁");
+        let source = self.connection.lock();
         let mut destination =
             Connection::open(&path).with_context(|| format!("无法创建备份 {}", path.display()))?;
         let backup = Backup::new(&source, &mut destination)?;
@@ -755,7 +789,7 @@ impl Database {
     pub fn ensure_daily_backup(&self) -> Result<()> {
         let today = Local::now().format("%Y-%m-%d").to_string();
         {
-            let connection = self.connection.lock().expect("数据库互斥锁");
+            let connection = self.connection.lock();
             let last: Option<String> = connection
                 .query_row(
                     "SELECT value FROM settings WHERE key = 'last_auto_backup_date'",
@@ -768,7 +802,7 @@ impl Database {
             }
         }
         self.create_backup("auto")?;
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection.execute(
             "INSERT INTO settings(key, value) VALUES('last_auto_backup_date', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -800,10 +834,17 @@ impl Database {
             bail!("备份不存在");
         }
 
-        self.create_backup("before-restore")?;
         let source =
             Connection::open_with_flags(&source_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let mut destination = self.connection.lock().expect("数据库互斥锁");
+        let backup_version: i64 = source.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if backup_version > SCHEMA_VERSION {
+            bail!(
+                "备份来自更高版本 v{backup_version}，当前应用仅支持 v{SCHEMA_VERSION}，已拒绝恢复以免损坏活动库"
+            );
+        }
+
+        self.create_backup("before-restore")?;
+        let mut destination = self.connection.lock();
         let backup = Backup::new(&source, &mut destination)?;
         backup.run_to_completion(64, Duration::from_millis(20), None)?;
         drop(backup);
@@ -972,6 +1013,8 @@ fn map_ai_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiMessage> {
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+
+    use rusqlite::Connection;
 
     use super::Database;
     use crate::models::{AnnotationKind, CreateAnnotation, SaveProgress};
@@ -1174,5 +1217,41 @@ mod tests {
         database.forget_book("book").expect("清空状态");
         database.restore_backup(&backup.name).expect("恢复备份");
         assert_eq!(database.annotation_count("book").expect("计数"), 1);
+    }
+
+    #[test]
+    fn restore_backup_rejects_newer_schema() {
+        let temp = TempDir::new().expect("临时目录");
+        let database = Database::open(temp.path()).expect("打开数据库");
+        let backup = database.create_backup("future").expect("创建备份");
+        let backup_path = temp.path().join("Backups").join(&backup.name);
+        {
+            let conn = Connection::open(&backup_path).expect("打开备份");
+            conn.pragma_update(None, "user_version", 999_i64)
+                .expect("抬高备份版本");
+        }
+        let error = database
+            .restore_backup(&backup.name)
+            .expect_err("更高版本备份必须被拒绝");
+        assert!(
+            error.to_string().contains("更高版本"),
+            "未报告更高版本：{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_second_active_question_task_for_the_same_book() {
+        let temp = TempDir::new().expect("临时目录");
+        let database = Database::open(temp.path()).expect("打开数据库");
+        database
+            .create_question_task("book", "codex", "第一个问题")
+            .expect("创建第一个任务");
+        let error = database
+            .create_question_task("book", "codex", "第二个问题")
+            .expect_err("同一本书的第二个活跃任务必须被拒绝");
+        assert!(
+            error.to_string().contains("已有正在运行"),
+            "未报告已有运行任务：{error}"
+        );
     }
 }

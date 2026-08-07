@@ -8,10 +8,11 @@ mod models;
 mod pdf_composer;
 mod server;
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use anyhow::Context;
+use parking_lot::Mutex;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 pub fn run() {
     let shutdown = Arc::new(Mutex::new(None));
@@ -19,6 +20,14 @@ pub fn run() {
     let shutdown_for_exit = shutdown.clone();
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // 已有实例运行时，把现有窗口拉回前台，而不是再启动一个进程并发写同一数据库。
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(move |app| {
             let data_dir = if let Some(path) = std::env::var_os("GOODREADER_DATA_DIR") {
                 std::path::PathBuf::from(path)
@@ -67,7 +76,7 @@ pub fn run() {
                 .recv_timeout(Duration::from_secs(15))
                 .context("本地 HTTP 服务启动超时")?
                 .map_err(anyhow::Error::msg)?;
-            *shutdown_for_setup.lock().expect("退出锁") = Some(shutdown_sender);
+            *shutdown_for_setup.lock() = Some(shutdown_sender);
 
             let allowed_origin = origin.clone();
             WebviewWindowBuilder::new(
@@ -101,7 +110,7 @@ pub fn run() {
             event,
             tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
         ) {
-            if let Some(sender) = shutdown_for_exit.lock().expect("退出锁").take() {
+            if let Some(sender) = shutdown_for_exit.lock().take() {
                 let _ = sender.send(());
             }
         }

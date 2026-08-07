@@ -1,15 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
+use parking_lot::Mutex;
 use url::Url;
 use uuid::Uuid;
 
@@ -28,12 +31,14 @@ use crate::models::{
 use crate::pdf_composer::{PdfCropBox, PdfPageComposer, PdfPageSource, PdfSourceLine};
 
 const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LOCALIZED_IMAGES: usize = 500;
 const MAX_ONLINE_CHAPTERS: usize = 200;
 const MAX_PDF_PAGES: usize = 5_000;
 const MAX_TRANSLATION_BATCH_BLOCKS: usize = 80;
 const MAX_TRANSLATION_BATCH_CHARS: usize = 12_000;
 const TRANSLATION_BATCH_CONCURRENCY: usize = 2;
 const BOOK_TITLE_TRANSLATION_ID: &str = "goodreader-metadata-book-title";
+const RENDER_WALL_CLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn is_unfinished_import_status(status: &str) -> bool {
     !matches!(status, "completed" | "cancelled")
@@ -189,7 +194,7 @@ impl ImportManager {
     }
 
     pub fn start(self: &Arc<Self>, request: StartImportRequest) -> Result<ImportTaskSummary> {
-        let _start_guard = self.start_lock.lock().expect("创建导入任务锁");
+        let _start_guard = self.start_lock.lock();
         if let Some(task) = self
             .list_tasks()?
             .into_iter()
@@ -207,6 +212,11 @@ impl ImportManager {
             bail!(
                 "这份 PDF 有 {} 页需要本地 OCR。当前版本尚未配置 OCR 模型，任务已停在预检阶段。",
                 preflight.preflight.requires_ocr_pages.len()
+            );
+        }
+        if request.translate && preflight.preflight.kind == ImportSourceKind::Pdf {
+            bail!(
+                "PDF 暂不支持翻译：逐页排版产生的页面缺少可翻译的正文块，会静默只翻译标题。可先单独导入 PDF，再处理翻译。"
             );
         }
         let uses_agent = request.translate || preflight.preflight.kind == ImportSourceKind::Pdf;
@@ -288,7 +298,6 @@ impl ImportManager {
     pub fn pause(&self, id: &str) -> Result<ImportTaskSummary> {
         self.paused
             .lock()
-            .expect("暂停任务锁")
             .insert(id.to_string());
         self.agent.cancel_generations_under(&self.root.join(id));
         let mut task = self.load_task(id)?;
@@ -318,8 +327,8 @@ impl ImportManager {
         if task.summary.status != "paused" && task.summary.status != "failed" {
             bail!("只有暂停或失败的任务可以继续");
         }
-        self.paused.lock().expect("暂停任务锁").remove(id);
-        self.cancelled.lock().expect("取消任务锁").remove(id);
+        self.paused.lock().remove(id);
+        self.cancelled.lock().remove(id);
         if let Some(runtime_id) = runtime_id.map(str::trim).filter(|value| !value.is_empty()) {
             let preflight = self.load_preflight(&task.request.token)?;
             if !task.request.translate && preflight.preflight.kind != ImportSourceKind::Pdf {
@@ -380,7 +389,6 @@ impl ImportManager {
     pub fn cancel(&self, id: &str) -> Result<ImportTaskSummary> {
         self.cancelled
             .lock()
-            .expect("取消任务锁")
             .insert(id.to_string());
         self.agent.cancel_generations_under(&self.root.join(id));
         let mut task = self.load_task(id)?;
@@ -1867,7 +1875,7 @@ impl ImportManager {
         context: EventContext,
     ) -> Result<()> {
         validate_id(id)?;
-        let _event_guard = self.event_lock.lock().expect("生成详情事件锁");
+        let _event_guard = self.event_lock.lock();
         let seq = self
             .load_events(id)?
             .into_iter()
@@ -2025,15 +2033,15 @@ impl ImportManager {
     }
 
     fn should_stop(&self, id: &str) -> bool {
-        self.cancelled.lock().expect("取消任务锁").contains(id)
-            || self.paused.lock().expect("暂停任务锁").contains(id)
+        self.cancelled.lock().contains(id)
+            || self.paused.lock().contains(id)
     }
 
     fn checkpoint(&self, id: &str) -> Result<()> {
-        if self.cancelled.lock().expect("取消任务锁").contains(id) {
+        if self.cancelled.lock().contains(id) {
             bail!("任务已取消");
         }
-        if self.paused.lock().expect("暂停任务锁").contains(id) {
+        if self.paused.lock().contains(id) {
             bail!("任务已暂停");
         }
         Ok(())
@@ -2211,17 +2219,28 @@ fn repeated_pdf_lines(pages: &[String]) -> HashSet<String> {
 }
 
 fn pdf_source_lines(text: &str, repeated_lines: &HashSet<String>) -> Vec<PdfSourceLine> {
-    let page_number = Regex::new(r"(?i)^(?:[0-9]+|[ivxlcdm]+)$").expect("页码正则固定有效");
-    text.lines()
+    static PAGE_NUMBER: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let page_number = PAGE_NUMBER
+        .get_or_init(|| Regex::new(r"(?i)^(?:[0-9]+|[ivxlcdm]+)$").expect("页码正则固定有效"));
+    let lines = text
+        .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let total = lines.len();
+    lines
+        .into_iter()
         .enumerate()
         .map(|(index, text)| {
             let normalized = normalize_pdf_line(text);
+            // 页码（阿拉伯或罗马）通常独占页面首或末几行；正文里恰好独占一行的
+            // 短词（如 "mix"、"did"）不能仅凭字符集被判为页码而遭省略。
+            let near_page_edge = index < 2 || index + 2 >= total;
+            let is_page_number = near_page_edge && page_number.is_match(text);
             PdfSourceLine {
                 id: format!("l{:04}", index + 1),
                 text: text.to_string(),
-                removable: page_number.is_match(text) || repeated_lines.contains(&normalized),
+                removable: is_page_number || repeated_lines.contains(&normalized),
             }
         })
         .collect()
@@ -2283,12 +2302,15 @@ fn render_pdf_region(
 }
 
 fn png_dimensions(path: &Path) -> Result<(usize, usize)> {
-    let bytes = fs::read(path).context("无法读取 PDF 页面图像")?;
-    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+    // 只读 PNG 头 24 字节取尺寸，避免把整张页面图像读进内存。
+    let mut file = fs::File::open(path).context("无法读取 PDF 页面图像")?;
+    let mut header = [0u8; 24];
+    file.read_exact(&mut header).context("PDF 页面渲染结果不是有效 PNG")?;
+    if &header[..8] != b"\x89PNG\r\n\x1a\n" {
         bail!("PDF 页面渲染结果不是有效 PNG");
     }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().expect("PNG 宽度字节"));
-    let height = u32::from_be_bytes(bytes[20..24].try_into().expect("PNG 高度字节"));
+    let width = u32::from_be_bytes(header[16..20].try_into().expect("PNG 宽度字节"));
+    let height = u32::from_be_bytes(header[20..24].try_into().expect("PNG 高度字节"));
     Ok((width as usize, height as usize))
 }
 
@@ -2711,7 +2733,7 @@ fn render_online_html(url: &Url) -> Result<String> {
     let chrome = find_chrome()?;
     let profile = std::env::temp_dir().join(format!("goodreader-web-{}", Uuid::new_v4()));
     fs::create_dir_all(&profile)?;
-    let output = Command::new(chrome)
+    let mut child = Command::new(chrome)
         .args([
             "--headless=new",
             "--disable-extensions",
@@ -2724,13 +2746,18 @@ fn render_online_html(url: &Url) -> Result<String> {
         ])
         .arg(format!("--user-data-dir={}", profile.display()))
         .arg(url.as_str())
-        .output();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("无法启动隔离浏览器")?;
+    let status = wait_child_with_timeout(&mut child, RENDER_WALL_CLOCK_TIMEOUT);
     let _ = fs::remove_dir_all(&profile);
-    let output = output?;
-    if !output.status.success() || output.stdout.is_empty() {
+    let status = status?;
+    let stdout = collect_child_stdout(&mut child)?;
+    if !status.success() || stdout.is_empty() {
         bail!("隔离浏览器无法生成稳定页面");
     }
-    String::from_utf8(output.stdout).context("隔离浏览器返回了无效 HTML")
+    Ok(stdout)
 }
 
 fn render_local_html(path: &Path) -> Result<String> {
@@ -2738,7 +2765,7 @@ fn render_local_html(path: &Path) -> Result<String> {
     let profile = std::env::temp_dir().join(format!("goodreader-local-{}", Uuid::new_v4()));
     fs::create_dir_all(&profile)?;
     let url = Url::from_file_path(path).map_err(|_| anyhow!("无法生成本地 HTML URL"))?;
-    let output = Command::new(chrome)
+    let mut child = Command::new(chrome)
         .args([
             "--headless=new",
             "--disable-extensions",
@@ -2751,13 +2778,42 @@ fn render_local_html(path: &Path) -> Result<String> {
         ])
         .arg(format!("--user-data-dir={}", profile.display()))
         .arg(url.as_str())
-        .output();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("无法启动隔离浏览器")?;
+    let status = wait_child_with_timeout(&mut child, RENDER_WALL_CLOCK_TIMEOUT);
     let _ = fs::remove_dir_all(&profile);
-    let output = output?;
-    if !output.status.success() || output.stdout.is_empty() {
+    let status = status?;
+    let stdout = collect_child_stdout(&mut child)?;
+    if !status.success() || stdout.is_empty() {
         bail!("隔离浏览器无法渲染本地 HTML");
     }
-    String::from_utf8(output.stdout).context("隔离浏览器返回了无效 HTML")
+    Ok(stdout)
+}
+
+fn wait_child_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().context("终止挂死的隔离浏览器失败")?;
+            let _ = child.wait();
+            bail!("隔离浏览器渲染超过 {} 秒墙钟上限", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn collect_child_stdout(child: &mut Child) -> Result<String> {
+    let mut bytes = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_end(&mut bytes)
+            .context("读取隔离浏览器输出失败")?;
+    }
+    String::from_utf8(bytes).context("隔离浏览器返回了无效 HTML")
 }
 
 fn find_chrome() -> Result<PathBuf> {
@@ -3270,8 +3326,11 @@ fn localize_images(
     destination: &Path,
     image_count: &mut usize,
 ) -> Result<String> {
-    let image_regex = Regex::new(r#"(?is)(<img\b[^>]*\bsrc\s*=\s*[\"'])([^\"']+)([\"'][^>]*>)"#)
-        .expect("图片来源正则固定有效");
+    static IMAGE_REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let image_regex = IMAGE_REGEX.get_or_init(|| {
+        Regex::new(r#"(?is)(<img\b[^>]*\bsrc\s*=\s*[\"'])([^\"']+)([\"'][^>]*>)"#)
+            .expect("图片来源正则固定有效")
+    });
     let mut result = String::with_capacity(html.len());
     let mut last = 0usize;
     for captures in image_regex.captures_iter(html) {
@@ -3292,7 +3351,14 @@ fn localize_images(
             .map(|value| value.as_str())
             .unwrap_or_default();
         let replacement = if let Ok(url) = page_url.join(source) {
-            if matches!(url.scheme(), "http" | "https") {
+            // 图片必须与章节同源且落在起始路径范围内（防止正文里的内网或越界链接
+            // 被本机抓取），并对总数量设上限，避免单页巨量图片撑满磁盘。
+            let allowed = matches!(url.scheme(), "http" | "https")
+                && *image_count < MAX_LOCALIZED_IMAGES
+                && enforce_source_scope(page_url, &url).is_ok();
+            if !allowed {
+                String::new()
+            } else {
                 let extension = Path::new(url.path())
                     .extension()
                     .and_then(|value| value.to_str())
@@ -3314,8 +3380,6 @@ fn localize_images(
                 } else {
                     String::new()
                 }
-            } else {
-                String::new()
             }
         } else {
             String::new()
@@ -4965,7 +5029,7 @@ printf 'done\n'
         use std::io::{ErrorKind, Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Mutex;
+        use parking_lot::Mutex;
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -4990,7 +5054,7 @@ printf 'done\n'
                 let request = String::from_utf8_lossy(&request[..length]);
                 let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
                 let count = {
-                    let mut counts = server_counts.lock().unwrap();
+                    let mut counts = server_counts.lock();
                     let count = counts.entry(path.clone()).or_insert(0);
                     *count += 1;
                     *count
@@ -5105,7 +5169,6 @@ printf 'done\n'
         assert_eq!(
             request_counts
                 .lock()
-                .unwrap()
                 .get("/book/ch1.html")
                 .copied(),
             Some(1)
@@ -5125,7 +5188,7 @@ printf 'done\n'
         server.join().unwrap();
         let completed = completed.expect("恢复后的在线任务应结束");
         assert_eq!(completed.status, "completed", "{:?}", completed.error);
-        let counts = request_counts.lock().unwrap();
+        let counts = request_counts.lock();
         assert_eq!(counts.get("/book/ch1.html").copied(), Some(1));
         assert_eq!(counts.get("/book/ch2.html").copied(), Some(2));
     }
