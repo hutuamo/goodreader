@@ -1204,9 +1204,10 @@ async fn save_setting(
     if input.value.len() > 256 {
         return Err(ApiError::bad_request("设置值过长"));
     }
+    let value = clamp_setting_value(&key, &input.value)?;
     state
         .database
-        .save_setting(&key, &input.value)
+        .save_setting(&key, &value)
         .map_err(ApiError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1484,6 +1485,21 @@ fn validate_setting_key(key: &str) -> Result<(), ApiError> {
     } else {
         Err(ApiError::bad_request("不支持的设置项"))
     }
+}
+
+fn clamp_setting_value(key: &str, value: &str) -> Result<String, ApiError> {
+    // 前端已用 parseClampedSetting 防御，这里在后端再钳一道，保证直接调用 API
+    // 或旧前端写入的数值设置始终落在合法区间。
+    let (min, max) = match key {
+        "reader-font-size" => (80_f64, 160_f64),
+        "sidebar-width" => (280_f64, 560_f64),
+        "ai-sidebar-width" => (340_f64, 720_f64),
+        _ => return Ok(value.to_string()),
+    };
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| ApiError::bad_request("设置值需要数值"))?;
+    Ok((parsed.clamp(min, max).round() as i64).to_string())
 }
 
 #[cfg(test)]
