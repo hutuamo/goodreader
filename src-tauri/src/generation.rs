@@ -2061,16 +2061,25 @@ fn repeated_pdf_lines(pages: &[String]) -> HashSet<String> {
 
 fn pdf_source_lines(text: &str, repeated_lines: &HashSet<String>) -> Vec<PdfSourceLine> {
     let page_number = Regex::new(r"(?i)^(?:[0-9]+|[ivxlcdm]+)$").expect("页码正则固定有效");
-    text.lines()
+    let lines = text
+        .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let total = lines.len();
+    lines
+        .into_iter()
         .enumerate()
         .map(|(index, text)| {
             let normalized = normalize_pdf_line(text);
+            // 页码（阿拉伯或罗马）通常独占页面首或末几行；正文里恰好独占一行的
+            // 短词（如 "mix"、"did"）不能仅凭字符集被判为页码而遭省略。
+            let near_page_edge = index < 2 || index + 2 >= total;
+            let is_page_number = near_page_edge && page_number.is_match(text);
             PdfSourceLine {
                 id: format!("l{:04}", index + 1),
                 text: text.to_string(),
-                removable: page_number.is_match(text) || repeated_lines.contains(&normalized),
+                removable: is_page_number || repeated_lines.contains(&normalized),
             }
         })
         .collect()
