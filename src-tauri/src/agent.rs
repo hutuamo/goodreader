@@ -12,7 +12,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch, Mutex as AsyncMutex};
 
 use crate::agent_session::{
     AgentSessionHost, ExecutionControl, ProviderExecutionEvent, ProviderKind, SessionConfig,
@@ -36,6 +36,8 @@ pub struct AgentCoordinator {
     database: Arc<Database>,
     active_processes: Arc<Mutex<HashMap<PathBuf, u32>>>,
     active_questions: Arc<Mutex<HashMap<String, ExecutionControl>>>,
+    /// 同书问答串行：覆盖共享工作区写入与跨 runtime 的 Provider turn
+    book_question_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     live_tasks: Arc<Mutex<HashMap<String, LiveTaskState>>>,
     sessions: AgentSessionHost,
     task_updates: broadcast::Sender<AgentTaskStreamEvent>,
@@ -133,6 +135,7 @@ impl AgentCoordinator {
             database,
             active_processes: Arc::new(Mutex::new(HashMap::new())),
             active_questions: Arc::new(Mutex::new(HashMap::new())),
+            book_question_locks: Arc::new(Mutex::new(HashMap::new())),
             live_tasks: Arc::new(Mutex::new(HashMap::new())),
             sessions: AgentSessionHost::new(),
             task_updates,
@@ -144,7 +147,23 @@ impl AgentCoordinator {
     }
 
     pub async fn dispose_book_sessions(&self, book_id: &str) {
+        // 先取消该书活跃问答，避免 dispose 在 turn 中长时间阻塞
+        if let Ok(tasks) = self.database.active_agent_tasks(book_id) {
+            for task in tasks {
+                let _ = self.stop_question(&task.id);
+            }
+        }
+        let lock = self.book_question_lock(book_id);
+        let _ = tokio::time::timeout(Duration::from_secs(5), lock.lock()).await;
         self.sessions.dispose_book(book_id).await;
+    }
+
+    fn book_question_lock(&self, book_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.book_question_locks.lock().expect("Agent 书籍问答锁表");
+        locks
+            .entry(book_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
     pub async fn runtimes(&self) -> Result<Vec<AgentRuntime>> {
@@ -206,6 +225,7 @@ impl AgentCoordinator {
             true,
             Some(&logs),
             Some(&self.active_processes),
+            None,
         )
         .await?;
         Ok(())
@@ -356,6 +376,7 @@ impl AgentCoordinator {
                 uses_stdin,
                 Some(&logs),
                 Some(&self.active_processes),
+                None,
             )
             .await?
         };
@@ -474,7 +495,8 @@ impl AgentCoordinator {
         {
             control.cancel();
         }
-        let workspace = self.tasks_dir.join(task_id);
+        // 进程登记键是共享会话工作区，不是 tasks_dir/<task_id>
+        let workspace = session_workspace(&self.tasks_dir, &task.book_id);
         if let Some(pid) = self
             .active_processes
             .lock()
@@ -528,6 +550,17 @@ impl AgentCoordinator {
         task: &AgentTask,
         control: &ExecutionControl,
     ) -> Result<()> {
+        // 同书串行：防止共享 workspace 被并发覆盖，以及跨 runtime 问答错配
+        let book_lock = self.book_question_lock(&task.book_id);
+        let _book_guard = book_lock.lock().await;
+        if self
+            .database
+            .agent_task(&task.id)?
+            .is_some_and(|current| current.status == "stopped")
+        {
+            bail!("Agent 任务已停止");
+        }
+
         let runtime = self.runtime_spec(&task.current_runtime_id)?;
         let execution_id = self.database.start_agent_execution(&task.id, &runtime.id)?;
 
@@ -548,7 +581,13 @@ impl AgentCoordinator {
                 self.run_native_question(&runtime, task, &workspace, control)
                     .await?
             } else {
-                let output = run_runtime(&runtime, &workspace, &self.active_processes).await?;
+                let output = run_runtime(
+                    &runtime,
+                    &workspace,
+                    &self.active_processes,
+                    Some(control.subscribe()),
+                )
+                .await?;
                 if let Some(live) = self
                     .live_tasks
                     .lock()
@@ -742,17 +781,7 @@ impl AgentCoordinator {
         task: &AgentTask,
         history: &[AiMessage],
     ) -> Result<PathBuf> {
-        let session_directory = task
-            .book_id
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let workspace = self
-            .tasks_dir
-            .join("Sessions")
-            .join(session_directory)
-            .join("workspace");
+        let workspace = session_workspace(&self.tasks_dir, &task.book_id);
         let context_dir = workspace.join("context");
         let book_dir = workspace.join("book");
         let chapters_dir = book_dir.join("chapters");
@@ -912,10 +941,40 @@ async fn probe_version(executable: &Path, kind: &RuntimeKind) -> Result<String> 
     Ok(version.lines().next().unwrap_or_default().to_string())
 }
 
+fn session_workspace(tasks_dir: &Path, book_id: &str) -> PathBuf {
+    let session_directory = book_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    tasks_dir
+        .join("Sessions")
+        .join(session_directory)
+        .join("workspace")
+}
+
+/// 等待 cancel 通道变为 true；无通道时永远 pending。
+async fn wait_for_cancel(cancel: &mut Option<watch::Receiver<bool>>) {
+    let Some(rx) = cancel.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
 async fn run_runtime(
     runtime: &RuntimeSpec,
     workspace: &Path,
     active_processes: &Arc<Mutex<HashMap<PathBuf, u32>>>,
+    cancel: Option<watch::Receiver<bool>>,
 ) -> Result<RuntimeOutput> {
     let instruction = "请阅读 context/current.md，并完成其中的 GoodReader 书籍问答任务。";
     run_runtime_instruction(
@@ -925,6 +984,7 @@ async fn run_runtime(
         false,
         None,
         Some(active_processes),
+        cancel,
     )
     .await
 }
@@ -936,6 +996,7 @@ async fn run_runtime_instruction(
     writable: bool,
     live_logs: Option<&Path>,
     active_processes: Option<&Arc<Mutex<HashMap<PathBuf, u32>>>>,
+    cancel: Option<watch::Receiver<bool>>,
 ) -> Result<RuntimeOutput> {
     let mut command = Command::new(&runtime.executable);
     command.current_dir(workspace);
@@ -1001,6 +1062,7 @@ async fn run_runtime_instruction(
         uses_stdin,
         live_logs,
         active_processes,
+        cancel,
     )
     .await?;
     if matches!(runtime.kind, RuntimeKind::OpenCode) {
@@ -1036,6 +1098,7 @@ async fn execute_command(
     uses_stdin: bool,
     live_logs: Option<&Path>,
     active_processes: Option<&Arc<Mutex<HashMap<PathBuf, u32>>>>,
+    cancel: Option<watch::Receiver<bool>>,
 ) -> Result<RuntimeOutput> {
     execute_command_with_limits(
         command,
@@ -1044,6 +1107,7 @@ async fn execute_command(
         uses_stdin,
         live_logs,
         active_processes,
+        cancel,
         EXECUTION_TIMEOUT,
         NETWORK_FAILURE_TIMEOUT,
     )
@@ -1057,6 +1121,7 @@ async fn execute_command_with_limits(
     uses_stdin: bool,
     live_logs: Option<&Path>,
     active_processes: Option<&Arc<Mutex<HashMap<PathBuf, u32>>>>,
+    mut cancel: Option<watch::Receiver<bool>>,
     execution_timeout: Duration,
     network_failure_timeout: Duration,
 ) -> Result<RuntimeOutput> {
@@ -1108,6 +1173,10 @@ async fn execute_command_with_limits(
     let status = loop {
         tokio::select! {
             status = child.wait() => break Some(status?),
+            () = wait_for_cancel(&mut cancel) => {
+                forced_error = Some("Agent 任务已停止".to_string());
+                break None;
+            }
             _ = monitor.tick() => {
                 if network_failure.load(Ordering::Relaxed) && network_failure_started.is_none() {
                     network_failure_started = Some(Instant::now());
@@ -1640,11 +1709,11 @@ mod tests {
     use super::{
         chapter_markdown, custom_runtime_spec, execute_claude_translation_command, execute_command,
         execute_command_with_limits, filter_claude_translation_event,
-        parse_claude_translation_stream, run_runtime_instruction, terminate_process_group,
-        truncate, AgentCoordinator,
+        parse_claude_translation_stream, run_runtime_instruction, session_workspace,
+        terminate_process_group, truncate, AgentCoordinator,
     };
     use crate::db::Database;
-    use crate::models::CustomAgentRuntime;
+    use crate::models::{BookManifest, BookPackage, ChapterManifest, CustomAgentRuntime};
 
     #[test]
     fn builds_a_book_view_with_stable_block_ids() {
@@ -1703,6 +1772,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"session-1","part":{"type":"ste
                 false,
                 None,
                 None,
+                None,
             ),
         )
         .await
@@ -1750,7 +1820,7 @@ exit 2
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let error = match execute_command(command, temp.path(), "", true, None, None).await {
+        let error = match execute_command(command, temp.path(), "", true, None, None, None).await {
             Ok(_) => panic!("运行时应失败"),
             Err(error) => error,
         };
@@ -1788,6 +1858,7 @@ sleep 30
             temp.path(),
             "question",
             true,
+            None,
             None,
             None,
             Duration::from_secs(5),
@@ -1836,6 +1907,7 @@ sleep 0.3
             true,
             None,
             None,
+            None,
             Duration::from_secs(5),
             Duration::from_millis(150),
         )
@@ -1873,6 +1945,7 @@ sleep 0.3
                 true,
                 None,
                 Some(&active_for_run),
+                None,
             )
             .await
         });
@@ -1995,5 +2068,123 @@ sleep 30
         assert_eq!(result.translations, blocks);
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(!workspace.join("logs/process.pid").exists());
+    }
+
+    #[tokio::test]
+    async fn stop_question_terminates_a_legacy_runtime_process() {
+        let temp = TempDir::new().expect("临时目录");
+        let database = Arc::new(Database::open(&temp.path().join("Data")).unwrap());
+        let executable = temp.path().join("long-running-agent.sh");
+        fs::write(&executable, "#!/bin/sh\ncat >/dev/null\nsleep 60\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let runtime = database
+            .save_custom_agent_runtime("长跑 Agent", executable.to_str().unwrap(), &[])
+            .unwrap();
+
+        let book_id = "11111111-1111-1111-1111-111111111111";
+        let book_root = temp.path().join("book");
+        fs::create_dir_all(book_root.join("chapters")).unwrap();
+        fs::write(
+            book_root.join("chapters/chapter-0001.html"),
+            r#"<main data-goodreader-content data-goodreader-chapter="c1"><p data-goodreader-block="c1-b1">正文</p></main>"#,
+        )
+        .unwrap();
+        // macOS 临时目录常经 /var → /private/var 符号链接；canonical 根路径才能通过包内路径校验
+        let book_root = book_root.canonicalize().unwrap();
+        let package = BookPackage {
+            root: book_root,
+            manifest: BookManifest {
+                schema_version: 1,
+                id: book_id.to_string(),
+                title: "测试书".to_string(),
+                original_title: None,
+                author: "作者".to_string(),
+                language: Some("zh-CN".to_string()),
+                source_language: None,
+                target_language: None,
+                cover: "cover.png".to_string(),
+                entry: "chapters/chapter-0001.html".to_string(),
+                chapters: vec![ChapterManifest {
+                    id: "c1".to_string(),
+                    title: "第一章".to_string(),
+                    path: "chapters/chapter-0001.html".to_string(),
+                    parallel_text: None,
+                }],
+            },
+        };
+
+        let tasks_dir = temp.path().join("Tasks");
+        let coordinator =
+            Arc::new(AgentCoordinator::new(tasks_dir.clone(), database.clone()).unwrap());
+        let task = database
+            .create_question_task(book_id, &runtime.id, "请回答问题")
+            .unwrap();
+        coordinator.start_question(package, Vec::new(), task.clone());
+
+        let workspace = session_workspace(&tasks_dir, book_id);
+        let pid_result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = coordinator
+                    .active_processes
+                    .lock()
+                    .expect("进程锁")
+                    .get(&workspace)
+                    .copied()
+                {
+                    break pid;
+                }
+                let current = database.agent_task(&task.id).unwrap();
+                if current.as_ref().is_some_and(|t| {
+                    matches!(t.status.as_str(), "paused" | "completed" | "stopped")
+                }) {
+                    panic!(
+                        "任务过早结束：status={:?} error={:?} workspace={}",
+                        current.as_ref().map(|t| &t.status),
+                        current.as_ref().and_then(|t| t.error.as_ref()),
+                        workspace.display()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let _pid = match pid_result {
+            Ok(pid) => pid,
+            Err(_) => {
+                let current = database.agent_task(&task.id).unwrap();
+                panic!(
+                    "legacy 进程应按会话工作区登记；task={:?} processes={:?}",
+                    current,
+                    coordinator
+                        .active_processes
+                        .lock()
+                        .expect("进程锁")
+                        .keys()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                );
+            }
+        };
+
+        let stopped = coordinator.stop_question(&task.id).expect("停止问答");
+        assert_eq!(stopped.status, "stopped");
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !coordinator
+                    .active_processes
+                    .lock()
+                    .expect("进程锁")
+                    .contains_key(&workspace)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("停止后活动进程表应清除会话工作区条目");
     }
 }

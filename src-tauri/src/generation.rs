@@ -2027,27 +2027,35 @@ fn prepare_html_source(
     })
 }
 
+/// 识别跨页重复的页眉/页脚候选。
+/// 规则刻意收紧：只看每页最靠边缘的 1 行、短文本、且覆盖过半页面，
+/// 避免跨页重复的正文表头/栏目名被标为 removable 后静默省略。
 fn repeated_pdf_lines(pages: &[String]) -> HashSet<String> {
+    if pages.is_empty() {
+        return HashSet::new();
+    }
     let mut counts = HashMap::<String, usize>::new();
     for page in pages {
         let lines = page
             .lines()
             .map(normalize_pdf_line)
-            .filter(|line| !line.is_empty() && line.chars().count() <= 120)
+            .filter(|line| !line.is_empty() && line.chars().count() <= 40)
             .collect::<Vec<_>>();
         let unique = lines
             .iter()
-            .take(3)
-            .chain(lines.iter().rev().take(3))
+            .take(1)
+            .chain(lines.iter().rev().take(1))
             .cloned()
             .collect::<HashSet<_>>();
         for line in unique {
             *counts.entry(line).or_default() += 1;
         }
     }
+    // 至少 3 页，且覆盖不少于一半页面
+    let threshold = ((pages.len() + 1) / 2).max(3);
     counts
         .into_iter()
-        .filter_map(|(line, count)| (count >= 3).then_some(line))
+        .filter_map(|(line, count)| (count >= threshold).then_some(line))
         .collect()
 }
 
@@ -2246,6 +2254,10 @@ fn validate_start_request(request: &StartImportRequest, preflight: &ImportPrefli
     }
     if request.preserve_original && !request.translate {
         bail!("只有翻译书籍才能保留对照原文");
+    }
+    // 后端硬拒绝：PDF 制书当前不支持翻译（前端已禁用，防绕过 UI）
+    if request.translate && preflight.kind == ImportSourceKind::Pdf {
+        bail!("PDF 制书当前不支持翻译");
     }
     Ok(())
 }
@@ -3875,6 +3887,76 @@ mod tests {
         let english = "This is an English book about a local reading application with complete chapters and figures. ".repeat(8);
         assert_eq!(detect_language(&chinese).0, "zh-CN");
         assert_eq!(detect_language(&english).0, "non-zh");
+    }
+
+    #[test]
+    fn does_not_mark_repeated_body_lines_as_removable() {
+        // 3 页顶部同一段较长正文：收紧后不得标为 removable，避免合法省略正文
+        let body = "This is a substantial body sentence that appears at the top of several pages.";
+        let pages = vec![
+            format!("{body}\nPage one content."),
+            format!("{body}\nPage two content."),
+            format!("{body}\nPage three content."),
+        ];
+        let repeated = super::repeated_pdf_lines(&pages);
+        assert!(
+            !repeated.contains(&super::normalize_pdf_line(body)),
+            "跨页重复的正文行不得标为 removable：{repeated:?}"
+        );
+    }
+
+    #[test]
+    fn marks_short_edge_headers_as_removable_when_widespread() {
+        let pages = (0..10)
+            .map(|index| {
+                format!("CONFIDENTIAL\nBody paragraph {index} with real content.\n{index}")
+            })
+            .collect::<Vec<_>>();
+        let repeated = super::repeated_pdf_lines(&pages);
+        assert!(
+            repeated.contains("CONFIDENTIAL"),
+            "短页眉在过半页面出现时应 removable：{repeated:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_pdf_import_with_translation_enabled() {
+        let preflight = ImportPreflight {
+            token: "t".to_string(),
+            kind: ImportSourceKind::Pdf,
+            source_name: "a.pdf".to_string(),
+            title: "书".to_string(),
+            original_title: "Book".to_string(),
+            author: "作者".to_string(),
+            language: "non-zh".to_string(),
+            language_confidence: "high".to_string(),
+            character_count: 100,
+            image_count: 0,
+            page_count: Some(1),
+            chapter_candidates: vec![ImportChapterCandidate {
+                id: "chapter-0001".to_string(),
+                title: "第 1 页".to_string(),
+                source: "pages:1-1".to_string(),
+                selected: true,
+            }],
+            requires_ocr_pages: Vec::new(),
+            uncertain_pages: Vec::new(),
+            pdf_mode: Some(PdfImportMode::TextLayer),
+            pdf_type: Some("digital".to_string()),
+            dynamic_rendering: false,
+            warnings: Vec::new(),
+        };
+        let request = StartImportRequest {
+            token: "t".to_string(),
+            title: "书".to_string(),
+            author: "作者".to_string(),
+            chapters: preflight.chapter_candidates.clone(),
+            translate: true,
+            preserve_original: false,
+            runtime_id: Some("codex".to_string()),
+        };
+        let error = super::validate_start_request(&request, &preflight).unwrap_err();
+        assert!(error.to_string().contains("PDF 制书当前不支持翻译"));
     }
 
     #[test]

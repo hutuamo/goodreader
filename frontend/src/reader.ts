@@ -1,4 +1,5 @@
 import MarkdownIt from "markdown-it";
+import { clampNumber, parseClampedSetting } from "./settings";
 
 type Progress = {
   bookId: string;
@@ -300,10 +301,6 @@ function applyReaderTheme(): void {
   toggle.setAttribute("aria-label", `切换到${nextTheme}模式`);
   toggle.title = `切换到${nextTheme}模式`;
   toggle.setAttribute("aria-pressed", String(theme === "dark"));
-}
-
-function clampNumber(value: number, minimum: number, maximum: number): number {
-  return Math.max(minimum, Math.min(maximum, value));
 }
 
 function readerTextElements(): HTMLElement[] {
@@ -2124,12 +2121,10 @@ async function boot(): Promise<void> {
       aiSendKey = savedAiSendKey;
     }
     topbarPinned = savedTopbarPinned === "true";
-    const parsedFontSize = Number(savedFontSize);
-    if (Number.isFinite(parsedFontSize)) readerFontSize = clampNumber(parsedFontSize, 80, 160);
-    const parsedSidebarWidth = Number(savedSidebarWidth);
-    if (Number.isFinite(parsedSidebarWidth)) sidebarWidth = parsedSidebarWidth;
-    const parsedAiSidebarWidth = Number(savedAiSidebarWidth);
-    if (Number.isFinite(parsedAiSidebarWidth)) aiSidebarWidth = parsedAiSidebarWidth;
+    // null / 空串不能走 Number(null)===0，否则会把默认字号钳到 80%
+    readerFontSize = parseClampedSetting(savedFontSize, 80, 160, 100);
+    sidebarWidth = parseClampedSetting(savedSidebarWidth, 240, 560, 360);
+    aiSidebarWidth = parseClampedSetting(savedAiSidebarWidth, 280, 640, 420);
     aiViewState = restoreAiViewState();
     restoreAiWorkspaceCache();
     applyBookLanguage();

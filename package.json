@@ -13,6 +13,7 @@
     "test:cover-replacement": "node scripts/check-cover-replacement.mjs",
     "test:reader-selection-ai": "node scripts/check-reader-selection-ai.mjs",
     "test:reader-display-settings": "node scripts/check-reader-display-settings.mjs",
+    "test:reader-settings": "node --test scripts/test-reader-settings.mjs",
     "test:reader-typography": "node scripts/check-reader-typography.mjs",
     "tauri": "tauri"
   },

@@ -14,7 +14,7 @@ use crate::models::{
     CustomAgentRuntime, Progress, SaveProgress,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 const BACKUP_LIMIT: usize = 7;
 const HIGHLIGHT_COLORS: [&str; 4] = ["yellow", "green", "blue", "pink"];
 
@@ -446,6 +446,16 @@ impl Database {
         let message_id = Uuid::new_v4().to_string();
         let mut connection = self.connection.lock().expect("数据库互斥锁");
         let transaction = connection.transaction()?;
+        // 检查与插入同一事务，避免双 POST 并发创建两个活跃问答任务
+        let active_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM agent_tasks
+             WHERE book_id = ?1 AND status NOT IN ('completed', 'stopped')",
+            [book_id],
+            |row| row.get(0),
+        )?;
+        if active_count > 0 {
+            bail!("这本书已有正在运行的 AI 请求，请先等待完成或停止当前请求");
+        }
         transaction.execute(
             "INSERT INTO agent_tasks(
                 id, book_id, kind, status, goal, current_runtime_id, error, created_at, updated_at
@@ -798,6 +808,18 @@ impl Database {
         let source_path = self.backups_dir.join(name);
         if !source_path.is_file() {
             bail!("备份不存在");
+        }
+
+        // 覆盖活动库前只读检查 schema 版本，避免先破坏再失败
+        {
+            let source = Connection::open_with_flags(
+                &source_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let version: i64 = source.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if version > SCHEMA_VERSION {
+                bail!("备份数据库版本 {version} 高于应用支持的 {SCHEMA_VERSION}，无法恢复");
+            }
         }
 
         self.create_backup("before-restore")?;
@@ -1174,5 +1196,42 @@ mod tests {
         database.forget_book("book").expect("清空状态");
         database.restore_backup(&backup.name).expect("恢复备份");
         assert_eq!(database.annotation_count("book").expect("计数"), 1);
+    }
+
+    #[test]
+    fn rejects_second_active_question_for_the_same_book() {
+        let temp = TempDir::new().expect("临时目录");
+        let database = Database::open(temp.path()).expect("打开数据库");
+        database
+            .create_question_task("book", "codex", "第一个问题")
+            .expect("创建首个问题任务");
+        let error = database
+            .create_question_task("book", "codex", "第二个问题")
+            .expect_err("同书不应允许第二个活跃问答");
+        assert!(error.to_string().contains("正在运行"));
+    }
+
+    #[test]
+    fn rejects_restoring_a_newer_schema_backup_before_overwriting() {
+        let temp = TempDir::new().expect("临时目录");
+        let database = Database::open(temp.path()).expect("打开数据库");
+        database
+            .create_annotation("book", &highlight(0, 4))
+            .expect("保存高亮");
+        let backup = database.create_backup("manual").expect("创建备份");
+        let backup_path = temp.path().join("Backups").join(&backup.name);
+        {
+            let conn = rusqlite::Connection::open(&backup_path).expect("打开备份");
+            conn.pragma_update(None, "user_version", super::SCHEMA_VERSION + 1)
+                .expect("抬高备份版本");
+        }
+        let error = database
+            .restore_backup(&backup.name)
+            .expect_err("更高 schema 备份必须在覆盖前拒绝");
+        assert!(error.to_string().contains("高于应用支持"));
+        assert_eq!(
+            database.annotation_count("book").expect("活动库保持原状"),
+            1
+        );
     }
 }

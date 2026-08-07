@@ -724,8 +724,18 @@ async fn stream_agent_task_events(
         .map(|task| state.agent.decorate_task(task))
         .ok_or_else(|| ApiError::not_found("Agent 任务不存在"))?;
     let requested_task_id = task_id.clone();
+    let agent = state.agent.clone();
+    let database = state.database.clone();
     let updates = BroadcastStream::new(task_updates).filter_map(move |result| match result {
         Ok(event) if event.task_id() == requested_task_id => Some(event),
+        // 广播缓冲溢出时补发 Snapshot，前端可用 sequence 去重自愈
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => database
+            .agent_task(&requested_task_id)
+            .ok()
+            .flatten()
+            .map(|task| AgentTaskStreamEvent::Snapshot {
+                task: agent.decorate_task(task),
+            }),
         _ => None,
     });
     let stream = tokio_stream::once(AgentTaskStreamEvent::Snapshot { task: current })
@@ -925,6 +935,9 @@ async fn delete_book_package(
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)?;
+
+    // 删除副本时同步清理封面覆盖，避免孤儿文件
+    remove_cover_override(&state.cover_overrides_dir, &book_id).map_err(ApiError::internal)?;
 
     let catalog = scan_books(&state.books_dir);
     *state.catalog.write().expect("书库写锁") = catalog;

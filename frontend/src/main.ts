@@ -805,10 +805,10 @@ async function showImportConfiguration(preflight: ImportPreflight): Promise<void
           `).join("")}
         </div>
       </section>
-      <section class="translation-options ${isChinese ? "disabled" : ""}">
+      <section class="translation-options ${isChinese || needsLayoutAgent ? "disabled" : ""}">
         <label class="option-row">
-          <input id="translateBook" type="checkbox" ${isChinese || !availableRuntimes.length ? "disabled" : ""} />
-          <span><strong>翻译为简体中文</strong><small>${isChinese ? "来源已经是中文，不需要翻译" : availableRuntimes.length ? "由本机 Agent 完成，耗时长于仅转换" : "没有可用 Agent，请先在设置中配置"}</small></span>
+          <input id="translateBook" type="checkbox" ${isChinese || needsLayoutAgent || !availableRuntimes.length ? "disabled" : ""} />
+          <span><strong>翻译为简体中文</strong><small>${needsLayoutAgent ? "PDF 制书当前不支持翻译，请先完成排版入架后再另做翻译流程" : isChinese ? "来源已经是中文，不需要翻译" : availableRuntimes.length ? "由本机 Agent 完成，耗时长于仅转换" : "没有可用 Agent，请先在设置中配置"}</small></span>
         </label>
         <label class="option-row">
           <input id="preserveOriginal" type="checkbox" disabled />
