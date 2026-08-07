@@ -618,6 +618,9 @@ fn choose_chapters(html_files: &[PathBuf], entry: &Path) -> Vec<PathBuf> {
 fn sanitize_html(html: &str, stats: &mut ConversionStats) -> String {
     let original = html;
     let mut clean = script_regex().replace_all(html, "").into_owned();
+    clean = stray_script_tag_regex()
+        .replace_all(&clean, "")
+        .into_owned();
     clean = active_element_regex().replace_all(&clean, "").into_owned();
     clean = active_open_tag_regex().replace_all(&clean, "").into_owned();
     clean = form_tag_regex().replace_all(&clean, "").into_owned();
@@ -990,6 +993,8 @@ macro_rules! regex {
 }
 
 regex!(script_regex, r"(?is)<script\b[^>]*>.*?</script\s*>");
+// 兜底清理未闭合或多余的 script 标签，避免仅靠成对匹配被绕过
+regex!(stray_script_tag_regex, r"(?is)</?script\b[^>]*>");
 regex!(
     active_element_regex,
     r"(?is)<(?:iframe|object|embed|svg)\b[^>]*>.*?</(?:iframe|object|embed|svg)\s*>"
@@ -1076,7 +1081,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{import_html_directory, natural_cmp, parse_legacy_parallel_text};
+    use super::{
+        import_html_directory, natural_cmp, parse_legacy_parallel_text, sanitize_html,
+        ConversionStats,
+    };
     use crate::library::validate_package;
 
     #[test]
@@ -1121,6 +1129,18 @@ mod tests {
             fs::read_to_string(source.join("chapters/ch1.html")).expect("重读源章节"),
             before
         );
+    }
+
+    #[test]
+    fn sanitize_removes_unclosed_script_tags() {
+        let mut stats = ConversionStats::default();
+        let clean = sanitize_html(
+            r#"<html><body><p>正文</p><script src="https://example.invalid/x.js"></body></html>"#,
+            &mut stats,
+        );
+        assert!(!clean.to_ascii_lowercase().contains("<script"));
+        assert!(clean.contains("正文"));
+        assert_eq!(stats.sanitized_html, 1);
     }
 
     #[test]

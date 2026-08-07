@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use parking_lot::Mutex;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
-use parking_lot::Mutex;
 
 use crate::agent_session::{
     terminate_process_group, AgentSessionHost, ExecutionControl, ProviderExecutionEvent,
@@ -511,7 +511,11 @@ impl AgentCoordinator {
         for path in collect_process_files(root) {
             if let Ok(value) = fs::read_to_string(&path) {
                 if let Ok(pid) = value.trim().parse::<u32>() {
-                    terminate_process_group(pid);
+                    // pid 文件可能过期数天，pid 早已被系统复用；
+                    // 仅当占用该 pid 的进程确实先于文件写入启动时才终止，避免误杀无关进程组
+                    if recorded_process_is_current(pid, &path) {
+                        terminate_process_group(pid);
+                    }
                 }
             }
             let _ = fs::remove_file(path);
@@ -560,14 +564,8 @@ impl AgentCoordinator {
                 }
             }
             coordinator.publish_task(&task.id);
-            coordinator
-                .active_questions
-                .lock()
-                .remove(&task.id);
-            coordinator
-                .live_tasks
-                .lock()
-                .remove(&task.id);
+            coordinator.active_questions.lock().remove(&task.id);
+            coordinator.live_tasks.lock().remove(&task.id);
             coordinator.publish_task(&task.id);
         });
     }
@@ -592,12 +590,7 @@ impl AgentCoordinator {
             // 自定义/Cursor 运行时与翻译批次把 pid 登记在 active_processes，键是
             // prepare_workspace 生成的工作区路径，按 book_id 解析后查询。
             let workspace = self.session_workspace(&book_id);
-            if let Some(pid) = self
-                .active_processes
-                .lock()
-                .get(&workspace)
-                .copied()
-            {
+            if let Some(pid) = self.active_processes.lock().get(&workspace).copied() {
                 terminate_process_group(pid);
             }
         }
@@ -606,12 +599,7 @@ impl AgentCoordinator {
     }
 
     pub fn decorate_task(&self, mut task: AgentTask) -> AgentTask {
-        if let Some(live) = self
-            .live_tasks
-            .lock()
-            .get(&task.id)
-            .cloned()
-        {
+        if let Some(live) = self.live_tasks.lock().get(&task.id).cloned() {
             task.phase = live.phase;
             task.partial_output = (!live.partial_output.is_empty()).then_some(live.partial_output);
             task.stream_sequence = Some(live.stream_sequence);
@@ -670,11 +658,7 @@ impl AgentCoordinator {
                     .await?
             } else {
                 let output = run_runtime(&runtime, &workspace, &self.active_processes).await?;
-                if let Some(live) = self
-                    .live_tasks
-                    .lock()
-                    .get_mut(&task.id)
-                {
+                if let Some(live) = self.live_tasks.lock().get_mut(&task.id) {
                     live.partial_output = output.answer.clone();
                 }
                 output
@@ -1205,9 +1189,7 @@ async fn execute_command_with_limits(
     let mut child = command.spawn().context("无法启动 Agent 运行时")?;
     let pid = child.id().context("无法取得 Agent 进程标识")?;
     if let Some(processes) = active_processes {
-        processes
-            .lock()
-            .insert(workspace.to_path_buf(), pid);
+        processes.lock().insert(workspace.to_path_buf(), pid);
     }
     if let Some(logs) = live_logs {
         fs::create_dir_all(logs)?;
@@ -1313,9 +1295,7 @@ async fn execute_claude_translation_command(
     }
     let mut child = command.spawn().context("无法启动 Claude 翻译运行时")?;
     let pid = child.id().context("无法取得 Agent 进程标识")?;
-    active_processes
-        .lock()
-        .insert(workspace.to_path_buf(), pid);
+    active_processes.lock().insert(workspace.to_path_buf(), pid);
     fs::create_dir_all(logs)?;
     fs::write(logs.join("process.pid"), pid.to_string())?;
 
@@ -1614,13 +1594,57 @@ fn finish_process_tracking(
     active_processes: Option<&Arc<Mutex<HashMap<PathBuf, u32>>>>,
 ) {
     if let Some(processes) = active_processes {
-        processes
-            .lock()
-            .remove(workspace);
+        processes.lock().remove(workspace);
     }
     if let Some(logs) = live_logs {
         let _ = fs::remove_file(logs.join("process.pid"));
     }
+}
+
+// pid 文件在子进程启动后立即写入；若当前占用该 pid 的进程启动时间晚于文件修改时间，
+// 说明原进程早已退出、pid 已被复用，不能再按记录终止
+#[cfg(unix)]
+fn recorded_process_is_current(pid: u32, pid_file: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(pid_file) else {
+        return false;
+    };
+    let Ok(recorded_at) = metadata.modified() else {
+        return false;
+    };
+    let Some(started_at) = process_start_time(pid) else {
+        return false;
+    };
+    started_at <= recorded_at
+}
+
+#[cfg(not(unix))]
+fn recorded_process_is_current(_pid: u32, _pid_file: &Path) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    let output = std::process::Command::new("ps")
+        .env("LC_ALL", "C")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ps_lstart(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(unix)]
+fn parse_ps_lstart(value: &str) -> Option<std::time::SystemTime> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let naive = chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y").ok()?;
+    // ps 的 lstart 使用本地时区
+    let local = chrono::TimeZone::from_local_datetime(&chrono::Local, &naive).single()?;
+    Some(local.into())
 }
 
 fn collect_process_files(root: &Path) -> Vec<PathBuf> {
@@ -1754,11 +1778,11 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
-    use parking_lot::Mutex;
     use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
@@ -1766,8 +1790,9 @@ mod tests {
     use super::{
         chapter_markdown, classify_agent_failure, custom_runtime_spec,
         execute_claude_translation_command, execute_command, execute_command_with_limits,
-        filter_claude_translation_event, parse_claude_translation_stream, run_runtime_instruction,
-        terminate_process_group, truncate, AgentCoordinator, AgentFailureClass,
+        filter_claude_translation_event, parse_claude_translation_stream, parse_ps_lstart,
+        run_runtime_instruction, terminate_process_group, truncate, AgentCoordinator,
+        AgentFailureClass,
     };
     use crate::db::Database;
     use crate::models::CustomAgentRuntime;
@@ -1814,6 +1839,22 @@ mod tests {
             classify_agent_failure(&anyhow::anyhow!("本地章节文件不存在")),
             AgentFailureClass::Unknown
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_ps_lstart_output() {
+        let parsed = parse_ps_lstart("Fri Aug  7 03:14:15 2026\n").expect("应能解析 lstart 输出");
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 8, 7)
+            .expect("固定日期有效")
+            .and_hms_opt(3, 14, 15)
+            .expect("固定时间有效");
+        let expected = chrono::TimeZone::from_local_datetime(&chrono::Local, &expected)
+            .single()
+            .map(|value| value.into());
+        assert_eq!(Some(parsed), expected);
+        assert!(parse_ps_lstart("").is_none());
+        assert!(parse_ps_lstart("not a date").is_none());
     }
 
     #[tokio::test]

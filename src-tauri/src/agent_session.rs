@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
-use parking_lot::Mutex;
 use uuid::Uuid;
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(60 * 30);
@@ -1069,9 +1069,7 @@ impl NativeProcess {
             loop {
                 match stream.read(&mut buffer).await {
                     Ok(0) | Err(_) => break,
-                    Ok(read) => stderr_for_task
-                        .lock()
-                        .extend_from_slice(&buffer[..read]),
+                    Ok(read) => stderr_for_task.lock().extend_from_slice(&buffer[..read]),
                 }
             }
         });

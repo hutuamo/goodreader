@@ -640,6 +640,13 @@ impl Database {
 
     pub fn stop_agent_task(&self, task_id: &str) -> Result<AgentTask> {
         let now = Utc::now().timestamp_millis();
+        // 先校验任务状态再落库，避免状态已变更却向调用方报错
+        let existing = self
+            .agent_task(task_id)?
+            .context("要停止的 Agent 任务不存在")?;
+        if !matches!(existing.status.as_str(), "queued" | "running" | "stopped") {
+            bail!("只有正在排队或运行的 Agent 任务可以停止");
+        }
         let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         transaction.execute(
@@ -648,20 +655,15 @@ impl Database {
              WHERE task_id = ?2 AND status = 'running'",
             params![now, task_id],
         )?;
-        let changed = transaction.execute(
+        transaction.execute(
             "UPDATE agent_tasks SET status = 'stopped', error = NULL, updated_at = ?1
              WHERE id = ?2 AND status IN ('queued', 'running')",
             params![now, task_id],
         )?;
         transaction.commit()?;
         drop(connection);
-        let task = self
-            .agent_task(task_id)?
-            .context("停止 Agent 任务后无法重新读取")?;
-        if changed == 0 && task.status != "stopped" {
-            bail!("只有正在排队或运行的 Agent 任务可以停止");
-        }
-        Ok(task)
+        self.agent_task(task_id)?
+            .context("停止 Agent 任务后无法重新读取")
     }
 
     pub fn retry_agent_task(&self, task_id: &str, runtime_id: &str) -> Result<AgentTask> {

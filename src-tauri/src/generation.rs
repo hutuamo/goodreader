@@ -3,16 +3,16 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
+use parking_lot::Mutex;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
-use parking_lot::Mutex;
 use url::Url;
 use uuid::Uuid;
 
@@ -284,7 +284,10 @@ impl ImportManager {
     pub fn events_since(&self, id: &str, after_seq: u64) -> Result<Vec<ImportTaskEvent>> {
         let task = self.load_task(id)?;
         let mut events = self.load_events(id)?;
-        if task.summary.status == "running" && task.summary.stage == "translating" {
+        // 翻译与 PDF 逐页排版都在 Agent 工作区写实时日志，两个阶段都需要附加实时输出
+        if task.summary.status == "running"
+            && matches!(task.summary.stage.as_str(), "translating" | "converting")
+        {
             if let Some(event) = self.live_agent_output(id)? {
                 events.push(event);
             }
@@ -296,9 +299,7 @@ impl ImportManager {
     }
 
     pub fn pause(&self, id: &str) -> Result<ImportTaskSummary> {
-        self.paused
-            .lock()
-            .insert(id.to_string());
+        self.paused.lock().insert(id.to_string());
         self.agent.cancel_generations_under(&self.root.join(id));
         let mut task = self.load_task(id)?;
         if matches!(task.summary.status.as_str(), "completed" | "cancelled") {
@@ -387,9 +388,7 @@ impl ImportManager {
     }
 
     pub fn cancel(&self, id: &str) -> Result<ImportTaskSummary> {
-        self.cancelled
-            .lock()
-            .insert(id.to_string());
+        self.cancelled.lock().insert(id.to_string());
         self.agent.cancel_generations_under(&self.root.join(id));
         let mut task = self.load_task(id)?;
         if task.summary.status == "completed" {
@@ -763,7 +762,9 @@ impl ImportManager {
         fs::create_dir_all(&page_workspace_root)?;
         let composer = PdfPageComposer::new(self.agent.clone());
         let repeated_lines = repeated_pdf_lines(&pages);
-        let image_pages = pdf_image_pages(&pdf).unwrap_or_default();
+        let pdf_for_scan = pdf.clone();
+        let image_pages =
+            tokio::task::spawn_blocking(move || pdf_image_pages(&pdf_for_scan)).await??;
         let total_pages = selected_pages.len();
         let mut page_html = BTreeMap::new();
         let mut image_count = 0usize;
@@ -774,7 +775,12 @@ impl ImportManager {
             let input_image = workspace.join("rendered-page.png");
             if !input_image.is_file() {
                 fs::create_dir_all(&workspace)?;
-                render_pdf_page(&pdf, page, &input_image, 144)?;
+                let pdf_for_render = pdf.clone();
+                let render_target = input_image.clone();
+                tokio::task::spawn_blocking(move || {
+                    render_pdf_page(&pdf_for_render, page, &render_target, 144)
+                })
+                .await??;
             }
             let (image_width, image_height) = png_dimensions(&input_image)?;
             let lines = pdf_source_lines(&pages[page - 1], &repeated_lines);
@@ -861,7 +867,13 @@ impl ImportManager {
             for (figure_index, figure) in composed.figures.iter().enumerate() {
                 let file_name = format!("page-{page:04}-figure-{:02}.png", figure_index + 1);
                 let figure_path = destination.join("assets/figures").join(&file_name);
-                render_pdf_region(&pdf, page, &figure.crop, &figure_path, 144)?;
+                let pdf_for_crop = pdf.clone();
+                let crop = figure.crop.clone();
+                let crop_target = figure_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    render_pdf_region(&pdf_for_crop, page, &crop, &crop_target, 144)
+                })
+                .await??;
                 let caption = if figure.caption.trim().is_empty() {
                     String::new()
                 } else {
@@ -901,7 +913,12 @@ impl ImportManager {
                 html_document(&chapter.title, &request.author, &body),
             )?;
         }
-        render_pdf_cover(&pdf, destination)?;
+        let pdf_for_cover = pdf.clone();
+        let destination_for_cover = destination.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            render_pdf_cover(&pdf_for_cover, &destination_for_cover)
+        })
+        .await??;
         fs::write(
             destination.join("index.html"),
             build_index_html(&request.title, &request.author, &selected),
@@ -1976,10 +1993,9 @@ impl ImportManager {
             summarize_agent_output(&stdout)
         } else if !stderr.trim().is_empty() {
             stderr
-        } else if stdout.trim().is_empty() {
-            "Agent 进程已启动，正在等待首个输出事件".to_string()
         } else {
-            format!("{stdout}\n\n--- stderr ---\n{stderr}")
+            // 走到这里说明 stdout/stderr 均为空但存在 pid 文件：进程已启动，尚未产生输出
+            "Agent 进程已启动，正在等待首个输出事件".to_string()
         };
         let created_at = [&stdout_path, &stderr_path, &process_path]
             .into_iter()
@@ -2033,8 +2049,7 @@ impl ImportManager {
     }
 
     fn should_stop(&self, id: &str) -> bool {
-        self.cancelled.lock().contains(id)
-            || self.paused.lock().contains(id)
+        self.cancelled.lock().contains(id) || self.paused.lock().contains(id)
     }
 
     fn checkpoint(&self, id: &str) -> Result<()> {
@@ -2305,7 +2320,8 @@ fn png_dimensions(path: &Path) -> Result<(usize, usize)> {
     // 只读 PNG 头 24 字节取尺寸，避免把整张页面图像读进内存。
     let mut file = fs::File::open(path).context("无法读取 PDF 页面图像")?;
     let mut header = [0u8; 24];
-    file.read_exact(&mut header).context("PDF 页面渲染结果不是有效 PNG")?;
+    file.read_exact(&mut header)
+        .context("PDF 页面渲染结果不是有效 PNG")?;
     if &header[..8] != b"\x89PNG\r\n\x1a\n" {
         bail!("PDF 页面渲染结果不是有效 PNG");
     }
@@ -3747,22 +3763,25 @@ fn needs_chinese_translation(value: &str) -> bool {
     })
 }
 
+// 可翻译正文块标签：提取与回写必须共用同一份列表，避免译文被静默丢弃
+const TRANSLATABLE_BLOCK_TAGS: [&str; 12] = [
+    "p",
+    "li",
+    "blockquote",
+    "pre",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "td",
+    "th",
+];
+
 fn chapter_blocks(html: &str) -> Vec<(String, String, String)> {
     let mut blocks = Vec::new();
-    for tag in [
-        "p",
-        "li",
-        "blockquote",
-        "pre",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "td",
-        "th",
-    ] {
+    for tag in TRANSLATABLE_BLOCK_TAGS {
         let regex = Regex::new(&format!(r#"(?is)<{tag}\b[^>]*\bdata-goodreader-block\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</{tag}\s*>"#)).expect("正文块正则固定有效");
         for captures in regex.captures_iter(html) {
             if let (Some(id), Some(inner)) = (captures.get(1), captures.get(2)) {
@@ -3853,19 +3872,7 @@ fn apply_translations(
                 originals.insert(id, visible_text(&inner));
             }
         }
-        for tag in [
-            "p",
-            "blockquote",
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "h5",
-            "h6",
-            "td",
-            "th",
-            "li",
-        ] {
+        for tag in TRANSLATABLE_BLOCK_TAGS {
             let block_regex = Regex::new(&format!(r#"(?is)(<{tag}\b[^>]*\bdata-goodreader-block\s*=\s*[\"']([^\"']+)[\"'][^>]*>)(.*?)(</{tag}\s*>)"#)).expect("正文替换正则固定有效");
             html = block_regex
                 .replace_all(&html, |captures: &regex::Captures<'_>| {
@@ -5025,11 +5032,11 @@ printf 'done\n'
 
     #[tokio::test]
     async fn resumes_online_conversion_from_completed_chapters() {
+        use parking_lot::Mutex;
         use std::collections::HashMap;
         use std::io::{ErrorKind, Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicBool, Ordering};
-        use parking_lot::Mutex;
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -5167,10 +5174,7 @@ printf 'done\n'
             "完成的在线章节应立即形成可见检查点"
         );
         assert_eq!(
-            request_counts
-                .lock()
-                .get("/book/ch1.html")
-                .copied(),
+            request_counts.lock().get("/book/ch1.html").copied(),
             Some(1)
         );
 
