@@ -147,6 +147,28 @@ impl AgentCoordinator {
     }
 
     pub async fn dispose_book_sessions(&self, book_id: &str) {
+        // dispose 必须拿到 backend 锁，而锁被当前 turn 持有直到自然结束（最长 30 分钟）。
+        // 先 cancel 并终止该书在飞问答的进程组，让 backend 尽快释放，避免移除书籍 /
+        // 清除 AI 工作区长时间卡住。
+        let task_ids = self
+            .database
+            .active_agent_tasks(book_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        {
+            let controls = self.active_questions.lock().expect("Agent 问题控制锁");
+            for task_id in &task_ids {
+                if let Some(control) = controls.get(task_id) {
+                    control.cancel();
+                    let pid = control.pid();
+                    if pid > 0 {
+                        terminate_process_group(pid);
+                    }
+                }
+            }
+        }
         self.sessions.dispose_book(book_id).await;
     }
 
