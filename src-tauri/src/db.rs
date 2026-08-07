@@ -14,7 +14,7 @@ use crate::models::{
     CustomAgentRuntime, Progress, SaveProgress,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 const BACKUP_LIMIT: usize = 7;
 const HIGHLIGHT_COLORS: [&str; 4] = ["yellow", "green", "blue", "pink"];
 

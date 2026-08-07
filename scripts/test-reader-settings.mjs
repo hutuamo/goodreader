@@ -35,3 +35,12 @@ test("越界值钳到区间边界", () => {
   assert.equal(parseClampedSetting("0", 100, 80, 160), 80);
   assert.equal(parseClampedSetting("999", 100, 80, 160), 160);
 });
+
+const readerSource = await readFile(new URL("../frontend/src/reader.ts", import.meta.url), "utf8");
+
+test("reader 字号与侧栏宽度走 parseClampedSetting", () => {
+  assert.match(readerSource, /parseClampedSetting\(savedFontSize/);
+  assert.match(readerSource, /parseClampedSetting\(\s*savedSidebarWidth/);
+  assert.match(readerSource, /parseClampedSetting\(\s*savedAiSidebarWidth/);
+  assert.doesNotMatch(readerSource, /const parsedFontSize = Number\(savedFontSize\)/);
+});

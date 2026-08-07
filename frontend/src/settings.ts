@@ -5,6 +5,10 @@
 // 侧栏宽度变成 0。这里把“读取持久化值 → 钳到合法区间”集中成一处，
 // 值缺失、空串或非有限时回到默认值，避免把“未设置”误判为 0。
 
+export function clampNumber(value: number, minimum: number, maximum: number): number {
+  return Math.min(Math.max(value, minimum), maximum);
+}
+
 export function parseClampedSetting(
   value: string | null | undefined,
   fallback: number,

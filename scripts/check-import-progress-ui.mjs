@@ -48,6 +48,10 @@ if (!source.includes('const needsLayoutAgent = preflight.kind === "pdf"')
   || !source.includes("needsLayoutAgent || translate?.checked")) {
   throw new Error("PDF 导入没有强制选择逐页排版 Agent");
 }
+if (!source.includes("PDF 制书当前不支持翻译")
+  || !source.includes("needsLayoutAgent || !availableRuntimes.length")) {
+  throw new Error("PDF 导入应禁用「翻译为简体中文」并说明不支持");
+}
 if (!source.includes("逐页调用 Agent 恢复阅读顺序、书籍排版和完整图片区域")) {
   throw new Error("PDF 导入没有向用户说明逐页 Agent 排版工作量");
 }

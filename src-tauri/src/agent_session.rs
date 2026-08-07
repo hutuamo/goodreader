@@ -140,7 +140,7 @@ impl ExecutionControl {
         }
     }
 
-    fn subscribe(&self) -> watch::Receiver<bool> {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<bool> {
         self.cancel.subscribe()
     }
 

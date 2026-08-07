@@ -1,6 +1,5 @@
 import MarkdownIt from "markdown-it";
-
-import { parseClampedSetting } from "./settings";
+import { clampNumber, parseClampedSetting } from "./settings";
 
 type Progress = {
   bookId: string;
@@ -302,10 +301,6 @@ function applyReaderTheme(): void {
   toggle.setAttribute("aria-label", `切换到${nextTheme}模式`);
   toggle.title = `切换到${nextTheme}模式`;
   toggle.setAttribute("aria-pressed", String(theme === "dark"));
-}
-
-function clampNumber(value: number, minimum: number, maximum: number): number {
-  return Math.max(minimum, Math.min(maximum, value));
 }
 
 function readerTextElements(): HTMLElement[] {

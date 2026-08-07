@@ -939,6 +939,9 @@ async fn delete_book_package(
         .map_err(ApiError::internal)?;
     remove_cover_override(&state.cover_overrides_dir, &book_id).map_err(ApiError::internal)?;
 
+    // 删除副本时同步清理封面覆盖，避免孤儿文件
+    remove_cover_override(&state.cover_overrides_dir, &book_id).map_err(ApiError::internal)?;
+
     let catalog = scan_books(&state.books_dir);
     *state.catalog.write().expect("书库写锁") = catalog;
     Ok(Json(build_bootstrap(&state).map_err(ApiError::internal)?))

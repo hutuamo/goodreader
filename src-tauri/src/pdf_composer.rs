@@ -343,7 +343,8 @@ fn validate_layout(layout: &PdfPageLayout, source: &PdfPageSource) -> Result<()>
     if !missing.is_empty() {
         bail!("Agent 页面排版遗漏来源行：{}", missing.join(", "));
     }
-    if layout.blocks.is_empty() && !source.lines.is_empty() {
+    // 空 blocks 一律拒绝（含无文本层纯图页），避免生成空白 pdf-page
+    if layout.blocks.is_empty() {
         bail!("Agent 没有生成任何页面内容");
     }
     if source.requires_figure && figure_count == 0 {
@@ -629,5 +630,24 @@ printf 'done\n'
 
         let error = validate_layout(&layout, &source).unwrap_err();
         assert!(error.to_string().contains("遗漏来源行：l0002"));
+    }
+
+    #[test]
+    fn rejects_empty_blocks_even_without_source_lines() {
+        let source = PdfPageSource {
+            page: 1,
+            image_path: "page.png".into(),
+            image_width: 800,
+            image_height: 1200,
+            requires_figure: false,
+            lines: Vec::new(),
+        };
+        let layout = PdfPageLayout {
+            page: 1,
+            blocks: Vec::new(),
+            omitted_line_ids: Vec::new(),
+        };
+        let error = validate_layout(&layout, &source).unwrap_err();
+        assert!(error.to_string().contains("没有生成任何页面内容"));
     }
 }
