@@ -937,6 +937,7 @@ async fn delete_book_package(
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)?;
+    remove_cover_override(&state.cover_overrides_dir, &book_id).map_err(ApiError::internal)?;
 
     let catalog = scan_books(&state.books_dir);
     *state.catalog.write().expect("书库写锁") = catalog;
