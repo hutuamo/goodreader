@@ -800,9 +800,16 @@ impl Database {
             bail!("备份不存在");
         }
 
-        self.create_backup("before-restore")?;
         let source =
             Connection::open_with_flags(&source_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let backup_version: i64 = source.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if backup_version > SCHEMA_VERSION {
+            bail!(
+                "备份来自更高版本 v{backup_version}，当前应用仅支持 v{SCHEMA_VERSION}，已拒绝恢复以免损坏活动库"
+            );
+        }
+
+        self.create_backup("before-restore")?;
         let mut destination = self.connection.lock().expect("数据库互斥锁");
         let backup = Backup::new(&source, &mut destination)?;
         backup.run_to_completion(64, Duration::from_millis(20), None)?;
@@ -972,6 +979,8 @@ fn map_ai_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiMessage> {
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+
+    use rusqlite::Connection;
 
     use super::Database;
     use crate::models::{AnnotationKind, CreateAnnotation, SaveProgress};
@@ -1174,5 +1183,25 @@ mod tests {
         database.forget_book("book").expect("清空状态");
         database.restore_backup(&backup.name).expect("恢复备份");
         assert_eq!(database.annotation_count("book").expect("计数"), 1);
+    }
+
+    #[test]
+    fn restore_backup_rejects_newer_schema() {
+        let temp = TempDir::new().expect("临时目录");
+        let database = Database::open(temp.path()).expect("打开数据库");
+        let backup = database.create_backup("future").expect("创建备份");
+        let backup_path = temp.path().join("Backups").join(&backup.name);
+        {
+            let conn = Connection::open(&backup_path).expect("打开备份");
+            conn.pragma_update(None, "user_version", 999_i64)
+                .expect("抬高备份版本");
+        }
+        let error = database
+            .restore_backup(&backup.name)
+            .expect_err("更高版本备份必须被拒绝");
+        assert!(
+            error.to_string().contains("更高版本"),
+            "未报告更高版本：{error}"
+        );
     }
 }
