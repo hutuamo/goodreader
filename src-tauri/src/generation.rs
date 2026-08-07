@@ -27,6 +27,7 @@ use crate::models::{
 use crate::pdf_composer::{PdfCropBox, PdfPageComposer, PdfPageSource, PdfSourceLine};
 
 const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LOCALIZED_IMAGES: usize = 500;
 const MAX_ONLINE_CHAPTERS: usize = 200;
 const MAX_PDF_PAGES: usize = 5_000;
 const MAX_TRANSLATION_BATCH_BLOCKS: usize = 80;
@@ -3184,7 +3185,14 @@ fn localize_images(
             .map(|value| value.as_str())
             .unwrap_or_default();
         let replacement = if let Ok(url) = page_url.join(source) {
-            if matches!(url.scheme(), "http" | "https") {
+            // 图片必须与章节同源且落在起始路径范围内（防止正文里的内网或越界链接
+            // 被本机抓取），并对总数量设上限，避免单页巨量图片撑满磁盘。
+            let allowed = matches!(url.scheme(), "http" | "https")
+                && *image_count < MAX_LOCALIZED_IMAGES
+                && enforce_source_scope(page_url, &url).is_ok();
+            if !allowed {
+                String::new()
+            } else {
                 let extension = Path::new(url.path())
                     .extension()
                     .and_then(|value| value.to_str())
@@ -3206,8 +3214,6 @@ fn localize_images(
                 } else {
                     String::new()
                 }
-            } else {
-                String::new()
             }
         } else {
             String::new()
