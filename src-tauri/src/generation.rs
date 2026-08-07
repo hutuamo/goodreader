@@ -2060,7 +2060,9 @@ fn repeated_pdf_lines(pages: &[String]) -> HashSet<String> {
 }
 
 fn pdf_source_lines(text: &str, repeated_lines: &HashSet<String>) -> Vec<PdfSourceLine> {
-    let page_number = Regex::new(r"(?i)^(?:[0-9]+|[ivxlcdm]+)$").expect("页码正则固定有效");
+    static PAGE_NUMBER: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let page_number = PAGE_NUMBER
+        .get_or_init(|| Regex::new(r"(?i)^(?:[0-9]+|[ivxlcdm]+)$").expect("页码正则固定有效"));
     let lines = text
         .lines()
         .map(str::trim)
@@ -3162,8 +3164,11 @@ fn localize_images(
     destination: &Path,
     image_count: &mut usize,
 ) -> Result<String> {
-    let image_regex = Regex::new(r#"(?is)(<img\b[^>]*\bsrc\s*=\s*[\"'])([^\"']+)([\"'][^>]*>)"#)
-        .expect("图片来源正则固定有效");
+    static IMAGE_REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let image_regex = IMAGE_REGEX.get_or_init(|| {
+        Regex::new(r#"(?is)(<img\b[^>]*\bsrc\s*=\s*[\"'])([^\"']+)([\"'][^>]*>)"#)
+            .expect("图片来源正则固定有效")
+    });
     let mut result = String::with_capacity(html.len());
     let mut last = 0usize;
     for captures in image_regex.captures_iter(html) {
