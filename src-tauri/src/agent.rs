@@ -15,8 +15,8 @@ use tokio::process::Command;
 use tokio::sync::broadcast;
 
 use crate::agent_session::{
-    AgentSessionHost, ExecutionControl, ProviderExecutionEvent, ProviderKind, SessionConfig,
-    SessionKey,
+    terminate_process_group, AgentSessionHost, ExecutionControl, ProviderExecutionEvent,
+    ProviderKind, SessionConfig, SessionKey,
 };
 use crate::db::Database;
 use crate::library::resolve_package_file;
@@ -465,24 +465,33 @@ impl AgentCoordinator {
 
     pub fn stop_question(&self, task_id: &str) -> Result<AgentTask> {
         let task = self.database.stop_agent_task(task_id)?;
-        if let Some(control) = self
-            .active_questions
-            .lock()
-            .expect("Agent 问题控制锁")
-            .get(task_id)
-            .cloned()
-        {
-            control.cancel();
-        }
-        let workspace = self.tasks_dir.join(task_id);
-        if let Some(pid) = self
-            .active_processes
-            .lock()
-            .expect("Agent 活动进程锁")
-            .get(&workspace)
-            .copied()
-        {
-            terminate_process_group(pid);
+        let book_id = task.book_id.clone();
+        // 原生会话（Codex/Claude/OpenCode）把子进程 pid 登记在 ExecutionControl，
+        // 优先用它杀进程组；这些进程从不进入 active_processes。
+        let native_pid = {
+            let controls = self.active_questions.lock().expect("Agent 问题控制锁");
+            if let Some(control) = controls.get(task_id) {
+                control.cancel();
+                control.pid()
+            } else {
+                0
+            }
+        };
+        if native_pid > 0 {
+            terminate_process_group(native_pid);
+        } else {
+            // 自定义/Cursor 运行时与翻译批次把 pid 登记在 active_processes，键是
+            // prepare_workspace 生成的工作区路径，按 book_id 解析后查询。
+            let workspace = self.session_workspace(&book_id);
+            if let Some(pid) = self
+                .active_processes
+                .lock()
+                .expect("Agent 活动进程锁")
+                .get(&workspace)
+                .copied()
+            {
+                terminate_process_group(pid);
+            }
         }
         self.publish_task(task_id);
         Ok(task)
@@ -742,17 +751,7 @@ impl AgentCoordinator {
         task: &AgentTask,
         history: &[AiMessage],
     ) -> Result<PathBuf> {
-        let session_directory = task
-            .book_id
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let workspace = self
-            .tasks_dir
-            .join("Sessions")
-            .join(session_directory)
-            .join("workspace");
+        let workspace = self.session_workspace(&task.book_id);
         let context_dir = workspace.join("context");
         let book_dir = workspace.join("book");
         let chapters_dir = book_dir.join("chapters");
@@ -815,6 +814,18 @@ impl AgentCoordinator {
         );
         fs::write(context_dir.join("current.md"), current)?;
         Ok(workspace)
+    }
+
+    fn session_workspace(&self, book_id: &str) -> PathBuf {
+        let session_directory = book_id
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.tasks_dir
+            .join("Sessions")
+            .join(session_directory)
+            .join("workspace")
     }
 }
 
@@ -1486,16 +1497,6 @@ fn finish_process_tracking(
     if let Some(logs) = live_logs {
         let _ = fs::remove_file(logs.join("process.pid"));
     }
-}
-
-fn terminate_process_group(pid: u32) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGTERM);
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
 }
 
 fn collect_process_files(root: &Path) -> Vec<PathBuf> {
