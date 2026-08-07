@@ -209,6 +209,11 @@ impl ImportManager {
                 preflight.preflight.requires_ocr_pages.len()
             );
         }
+        if request.translate && preflight.preflight.kind == ImportSourceKind::Pdf {
+            bail!(
+                "PDF 暂不支持翻译：逐页排版产生的页面缺少可翻译的正文块，会静默只翻译标题。可先单独导入 PDF，再处理翻译。"
+            );
+        }
         let uses_agent = request.translate || preflight.preflight.kind == ImportSourceKind::Pdf;
         if uses_agent && request.runtime_id.as_deref().unwrap_or_default().is_empty() {
             if preflight.preflight.kind == ImportSourceKind::Pdf {
