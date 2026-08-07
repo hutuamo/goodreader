@@ -1,6 +1,6 @@
 [package]
 name = "goodreader"
-version = "0.2.7"
+version = "0.2.10"
 description = "本地 HTML 书架与统一阅读器"
 authors = ["xhl"]
 edition = "2021"
@@ -25,6 +25,7 @@ serde_json = "1.0.149"
 subtle = "2.6.1"
 tauri = { version = "2.10.3", features = [] }
 tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "net", "sync", "time", "process", "io-util"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
 tower-http = { version = "0.5.2", features = ["trace"] }
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 url = "2.5"

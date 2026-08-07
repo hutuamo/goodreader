@@ -10,11 +10,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::models::{
-    AgentTask, AiMessage, Annotation, AnnotationKind, BackupInfo, CreateAnnotation,
+    AgentSession, AgentTask, AiMessage, Annotation, AnnotationKind, BackupInfo, CreateAnnotation,
     CustomAgentRuntime, Progress, SaveProgress,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const BACKUP_LIMIT: usize = 7;
 const HIGHLIGHT_COLORS: [&str; 4] = ["yellow", "green", "blue", "pink"];
 
@@ -135,7 +135,16 @@ impl Database {
             CREATE INDEX IF NOT EXISTS ai_message_book_created
             ON ai_messages(book_id, created_at ASC);
 
-            PRAGMA user_version = 2;
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                book_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                provider_session_id TEXT NOT NULL,
+                provider_state_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(book_id, runtime_id)
+            );
+
+            PRAGMA user_version = 3;
             "#,
         )?;
         Ok(())
@@ -355,13 +364,68 @@ impl Database {
         let annotations =
             transaction.execute("DELETE FROM annotations WHERE book_id = ?1", [book_id])?;
         transaction.execute("DELETE FROM agent_tasks WHERE book_id = ?1", [book_id])?;
+        transaction.execute("DELETE FROM agent_sessions WHERE book_id = ?1", [book_id])?;
         transaction.commit()?;
         Ok((progress, annotations))
     }
 
     pub fn clear_ai_workspace(&self, book_id: &str) -> Result<usize> {
+        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let transaction = connection.transaction()?;
+        let removed =
+            transaction.execute("DELETE FROM agent_tasks WHERE book_id = ?1", [book_id])?;
+        transaction.execute("DELETE FROM agent_sessions WHERE book_id = ?1", [book_id])?;
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    pub fn agent_session(&self, book_id: &str, runtime_id: &str) -> Result<Option<AgentSession>> {
         let connection = self.connection.lock().expect("数据库互斥锁");
-        Ok(connection.execute("DELETE FROM agent_tasks WHERE book_id = ?1", [book_id])?)
+        connection
+            .query_row(
+                "SELECT book_id, runtime_id, provider_session_id, provider_state_json, updated_at
+                 FROM agent_sessions WHERE book_id = ?1 AND runtime_id = ?2",
+                params![book_id, runtime_id],
+                |row| {
+                    Ok(AgentSession {
+                        book_id: row.get(0)?,
+                        runtime_id: row.get(1)?,
+                        provider_session_id: row.get(2)?,
+                        provider_state_json: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .context("读取 Agent 会话失败")
+    }
+
+    pub fn save_agent_session(
+        &self,
+        book_id: &str,
+        runtime_id: &str,
+        provider_session_id: &str,
+        provider_state_json: &str,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let connection = self.connection.lock().expect("数据库互斥锁");
+        connection.execute(
+            "INSERT INTO agent_sessions(
+                book_id, runtime_id, provider_session_id, provider_state_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(book_id, runtime_id) DO UPDATE SET
+                provider_session_id = excluded.provider_session_id,
+                provider_state_json = excluded.provider_state_json,
+                updated_at = excluded.updated_at",
+            params![
+                book_id,
+                runtime_id,
+                provider_session_id,
+                provider_state_json,
+                now
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn create_question_task(
@@ -456,11 +520,11 @@ impl Database {
         let changed = transaction.execute(
             "UPDATE agent_tasks
              SET status = 'running', current_runtime_id = ?1, error = NULL, updated_at = ?2
-             WHERE id = ?3",
+             WHERE id = ?3 AND status = 'queued'",
             params![runtime_id, now, task_id],
         )?;
         if changed == 0 {
-            bail!("Agent 任务不存在");
+            bail!("只有排队中的 Agent 任务可以开始执行");
         }
         transaction.execute(
             "INSERT INTO agent_executions(
@@ -487,10 +551,19 @@ impl Database {
         let message_id = Uuid::new_v4().to_string();
         let mut connection = self.connection.lock().expect("数据库互斥锁");
         let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE agent_tasks SET status = 'completed', error = NULL, updated_at = ?1
+             WHERE id = ?2 AND status = 'running'",
+            params![now, task_id],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(());
+        }
         transaction.execute(
             "UPDATE agent_executions
              SET status = 'completed', output = ?1, finished_at = ?2
-             WHERE id = ?3",
+             WHERE id = ?3 AND status = 'running'",
             params![content, now, execution_id],
         )?;
         transaction.execute(
@@ -500,11 +573,6 @@ impl Database {
              SELECT ?1, book_id, id, 'assistant', ?2, ?3, ?4
              FROM agent_tasks WHERE id = ?5",
             params![message_id, content, runtime_id, now, task_id],
-        )?;
-        transaction.execute(
-            "UPDATE agent_tasks SET status = 'completed', error = NULL, updated_at = ?1
-             WHERE id = ?2",
-            params![now, task_id],
         )?;
         transaction.commit()?;
         Ok(())
@@ -522,17 +590,44 @@ impl Database {
         if let Some(execution_id) = execution_id {
             transaction.execute(
                 "UPDATE agent_executions
-                 SET status = 'failed', error = ?1, finished_at = ?2 WHERE id = ?3",
+                 SET status = 'failed', error = ?1, finished_at = ?2
+                 WHERE id = ?3 AND status = 'running'",
                 params![error, now, execution_id],
             )?;
         }
         transaction.execute(
             "UPDATE agent_tasks SET status = 'paused', error = ?1, updated_at = ?2
-             WHERE id = ?3",
+             WHERE id = ?3 AND status NOT IN ('completed', 'stopped')",
             params![error, now, task_id],
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn stop_agent_task(&self, task_id: &str) -> Result<AgentTask> {
+        let now = Utc::now().timestamp_millis();
+        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE agent_executions
+             SET status = 'stopped', error = NULL, finished_at = ?1
+             WHERE task_id = ?2 AND status = 'running'",
+            params![now, task_id],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE agent_tasks SET status = 'stopped', error = NULL, updated_at = ?1
+             WHERE id = ?2 AND status IN ('queued', 'running')",
+            params![now, task_id],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        let task = self
+            .agent_task(task_id)?
+            .context("停止 Agent 任务后无法重新读取")?;
+        if changed == 0 && task.status != "stopped" {
+            bail!("只有正在排队或运行的 Agent 任务可以停止");
+        }
+        Ok(task)
     }
 
     pub fn retry_agent_task(&self, task_id: &str, runtime_id: &str) -> Result<AgentTask> {
@@ -853,6 +948,11 @@ fn map_agent_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentTask> {
         error: row.get(6)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
+        phase: None,
+        partial_output: None,
+        stream_sequence: None,
+        execution_id: None,
+        turn_id: None,
     })
 }
 
@@ -999,6 +1099,33 @@ mod tests {
     }
 
     #[test]
+    fn stopped_task_cannot_be_changed_back_to_paused_or_completed() {
+        let temp = TempDir::new().expect("临时目录");
+        let database = Database::open(temp.path()).expect("打开数据库");
+        let task = database
+            .create_question_task("book", "codex", "所有权是什么？")
+            .expect("创建问题任务");
+        let execution = database
+            .start_agent_execution(&task.id, "codex")
+            .expect("启动执行");
+
+        let stopped = database.stop_agent_task(&task.id).expect("停止任务");
+        assert_eq!(stopped.status, "stopped");
+        database
+            .pause_agent_execution(&task.id, Some(&execution), "进程被终止")
+            .expect("迟到的失败不得覆盖停止状态");
+        database
+            .complete_agent_execution(&task.id, &execution, "codex", "迟到的回答")
+            .expect("迟到的回答应被忽略");
+
+        assert_eq!(
+            database.agent_task(&task.id).unwrap().unwrap().status,
+            "stopped"
+        );
+        assert_eq!(database.ai_messages("book").expect("读取历史").len(), 1);
+    }
+
+    #[test]
     fn clearing_ai_workspace_preserves_reading_annotations() {
         let temp = TempDir::new().expect("临时目录");
         let database = Database::open(temp.path()).expect("打开数据库");
@@ -1012,6 +1139,28 @@ mod tests {
         assert_eq!(database.clear_ai_workspace("book").expect("清除 AI"), 1);
         assert_eq!(database.annotation_count("book").expect("计数"), 1);
         assert!(database.ai_messages("book").expect("读取历史").is_empty());
+    }
+
+    #[test]
+    fn persists_provider_sessions_and_clears_them_with_the_ai_workspace() {
+        let temp = TempDir::new().expect("临时目录");
+        let database = Database::open(temp.path()).expect("打开数据库");
+        database
+            .save_agent_session("book", "codex", "thread-1", r#"{"model":"gpt"}"#)
+            .expect("保存 Agent 会话");
+
+        let session = database
+            .agent_session("book", "codex")
+            .expect("读取 Agent 会话")
+            .expect("会话存在");
+        assert_eq!(session.provider_session_id, "thread-1");
+        assert_eq!(session.runtime_id, "codex");
+
+        database.clear_ai_workspace("book").expect("清除 AI 工作区");
+        assert!(database
+            .agent_session("book", "codex")
+            .expect("再次读取 Agent 会话")
+            .is_none());
     }
 
     #[test]

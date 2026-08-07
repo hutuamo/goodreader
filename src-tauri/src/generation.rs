@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,8 +19,10 @@ use crate::library::{resolve_package_file, validate_package};
 use crate::models::{
     ImportChapterCandidate, ImportPreflight, ImportQualityReport, ImportSourceKind,
     ImportTaskEvent, ImportTaskEventMetrics, ImportTaskEventProgress, ImportTaskEventRuntime,
-    ImportTaskEventTiming, ImportTaskSummary, ImportedBookSummary, StartImportRequest,
+    ImportTaskEventTiming, ImportTaskSummary, ImportedBookSummary, PdfImportMode,
+    StartImportRequest,
 };
+use crate::pdf_composer::{PdfCropBox, PdfPageComposer, PdfPageSource, PdfSourceLine};
 
 const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ONLINE_CHAPTERS: usize = 200;
@@ -110,14 +112,24 @@ impl ImportManager {
         Ok(manager)
     }
 
+    #[cfg(test)]
     pub fn preflight_local(
         &self,
         kind: ImportSourceKind,
         source: &Path,
     ) -> Result<ImportPreflight> {
+        self.preflight_local_with_pdf_mode(kind, source, PdfImportMode::Auto)
+    }
+
+    pub fn preflight_local_with_pdf_mode(
+        &self,
+        kind: ImportSourceKind,
+        source: &Path,
+        pdf_mode: PdfImportMode,
+    ) -> Result<ImportPreflight> {
         match kind {
             ImportSourceKind::Html => self.preflight_html(source),
-            ImportSourceKind::Pdf => self.preflight_pdf(source),
+            ImportSourceKind::Pdf => self.preflight_pdf(source, pdf_mode),
             ImportSourceKind::Url => bail!("在线来源必须提供 URL"),
         }
     }
@@ -156,6 +168,9 @@ impl ImportManager {
             image_count: image_reference_count(&html),
             character_count: text.chars().count(),
             requires_ocr_pages: Vec::new(),
+            uncertain_pages: Vec::new(),
+            pdf_mode: None,
+            pdf_type: None,
             dynamic_rendering: dynamic,
             warnings,
         };
@@ -191,7 +206,11 @@ impl ImportManager {
                 preflight.preflight.requires_ocr_pages.len()
             );
         }
-        if request.translate && request.runtime_id.as_deref().unwrap_or_default().is_empty() {
+        let uses_agent = request.translate || preflight.preflight.kind == ImportSourceKind::Pdf;
+        if uses_agent && request.runtime_id.as_deref().unwrap_or_default().is_empty() {
+            if preflight.preflight.kind == ImportSourceKind::Pdf {
+                bail!("PDF 制书必须选择一个可用 Agent");
+            }
             bail!("翻译为简体中文必须选择一个可用 Agent");
         }
 
@@ -203,7 +222,7 @@ impl ImportManager {
             stage: "queued".to_string(),
             progress: 0,
             title: request.title.trim().to_string(),
-            uses_agent: request.translate,
+            uses_agent,
             queue_order: now,
             detail: "等待生成槽位".to_string(),
             error: None,
@@ -299,7 +318,8 @@ impl ImportManager {
         self.paused.lock().expect("暂停任务锁").remove(id);
         self.cancelled.lock().expect("取消任务锁").remove(id);
         if let Some(runtime_id) = runtime_id.map(str::trim).filter(|value| !value.is_empty()) {
-            if !task.request.translate {
+            let preflight = self.load_preflight(&task.request.token)?;
+            if !task.request.translate && preflight.preflight.kind != ImportSourceKind::Pdf {
                 bail!("不需要 Agent 的任务不能切换运行时");
             }
             task.request.runtime_id = Some(runtime_id.to_string());
@@ -512,27 +532,32 @@ impl ImportManager {
             let (script_title, script_detail) =
                 conversion_script_description(&preflight.preflight.kind);
             self.append_event(id, "script", script_title, script_detail)?;
-            let request = task.request.clone();
-            let preflight_for_conversion = preflight.clone();
-            let prepared_dir_for_conversion = prepared_dir.clone();
-            let progress_manager = self.clone();
-            let progress_task_id = id.to_string();
-            let prepared = tokio::task::spawn_blocking(move || {
-                prepare_source(
-                    &preflight_for_conversion,
-                    &request,
-                    &prepared_dir_for_conversion,
-                    move |completed, total, reused| {
-                        progress_manager.record_online_chapter_progress(
-                            &progress_task_id,
-                            completed,
-                            total,
-                            reused,
-                        )
-                    },
-                )
-            })
-            .await??;
+            let prepared = if preflight.preflight.kind == ImportSourceKind::Pdf {
+                self.prepare_pdf_source_with_agent(id, &preflight, &task.request, &prepared_dir)
+                    .await?
+            } else {
+                let request = task.request.clone();
+                let preflight_for_conversion = preflight.clone();
+                let prepared_dir_for_conversion = prepared_dir.clone();
+                let progress_manager = self.clone();
+                let progress_task_id = id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    prepare_source(
+                        &preflight_for_conversion,
+                        &request,
+                        &prepared_dir_for_conversion,
+                        move |completed, total, reused| {
+                            progress_manager.record_online_chapter_progress(
+                                &progress_task_id,
+                                completed,
+                                total,
+                                reused,
+                            )
+                        },
+                    )
+                })
+                .await??
+            };
             write_json(&task_dir.join("prepared.json"), &prepared)?;
             self.append_event(
                 id,
@@ -682,8 +707,160 @@ impl ImportManager {
         self.append_event(id, "stage", "生成完成", "书籍已经进入书架")?;
         let _ = fs::remove_dir_all(&prepared_dir);
         let _ = fs::remove_dir_all(&candidate_books);
+        let _ = fs::remove_dir_all(self.root.join(id).join("pdf-layout"));
         let _ = fs::remove_dir_all(self.root.join(&task.request.token));
         Ok(())
+    }
+
+    async fn prepare_pdf_source_with_agent(
+        &self,
+        task_id: &str,
+        stored: &StoredPreflight,
+        request: &StartImportRequest,
+        destination: &Path,
+    ) -> Result<PreparedSource> {
+        let runtime_id = request
+            .runtime_id
+            .as_deref()
+            .context("PDF 制书必须选择一个可用 Agent")?;
+        let pdf = PathBuf::from(
+            stored
+                .source_path
+                .as_deref()
+                .context("PDF 来源快照不存在")?,
+        );
+        let text_path = pdf.parent().context("PDF 快照目录无效")?.join("source.txt");
+        let text = fs::read_to_string(&text_path).context("PDF 文本快照不存在")?;
+        let page_count = stored.preflight.page_count.context("PDF 页数缺失")?;
+        let pages = split_pdf_pages(&text, page_count);
+        let selected = request
+            .chapters
+            .iter()
+            .filter(|chapter| chapter.selected)
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            bail!("至少保留一个章节");
+        }
+        let mut selected_pages = BTreeSet::new();
+        for chapter in &selected {
+            let (start, end) = parse_page_range(&chapter.source, page_count)?;
+            selected_pages.extend(start..=end);
+        }
+        fs::create_dir_all(destination.join("chapters"))?;
+        fs::create_dir_all(destination.join("assets/figures"))?;
+        let page_workspace_root = self.root.join(task_id).join("pdf-layout/pages");
+        fs::create_dir_all(&page_workspace_root)?;
+        let composer = PdfPageComposer::new(self.agent.clone());
+        let repeated_lines = repeated_pdf_lines(&pages);
+        let image_pages = pdf_image_pages(&pdf).unwrap_or_default();
+        let total_pages = selected_pages.len();
+        let mut page_html = BTreeMap::new();
+        let mut image_count = 0usize;
+
+        for (completed, page) in selected_pages.iter().copied().enumerate() {
+            self.checkpoint(task_id)?;
+            let workspace = page_workspace_root.join(format!("page-{page:04}"));
+            let input_image = workspace.join("rendered-page.png");
+            if !input_image.is_file() {
+                fs::create_dir_all(&workspace)?;
+                render_pdf_page(&pdf, page, &input_image, 144)?;
+            }
+            let (image_width, image_height) = png_dimensions(&input_image)?;
+            let lines = pdf_source_lines(&pages[page - 1], &repeated_lines);
+            self.append_event_with_context(
+                task_id,
+                "agent",
+                &format!("Agent 正在排版 PDF 第 {page} 页"),
+                "正在恢复阅读顺序、语义块和完整图片区域",
+                EventContext {
+                    scope: Some(format!("pdf.page.{page}")),
+                    state: Some("running".to_string()),
+                    progress: Some(ImportTaskEventProgress {
+                        completed,
+                        total: total_pages,
+                        unit: "pages".to_string(),
+                    }),
+                    timing: Some(ImportTaskEventTiming {
+                        started_at: Utc::now().timestamp_millis(),
+                        elapsed_ms: 0,
+                        eta_ms: None,
+                    }),
+                    runtime: Some(ImportTaskEventRuntime {
+                        id: runtime_id.to_string(),
+                        model: None,
+                        session_id: None,
+                        pid: None,
+                    }),
+                    metrics: None,
+                },
+            )?;
+            let composed = composer
+                .compose(
+                    runtime_id,
+                    &workspace,
+                    &PdfPageSource {
+                        page,
+                        image_path: input_image,
+                        image_width,
+                        image_height,
+                        requires_figure: image_pages.contains(&page),
+                        lines,
+                    },
+                )
+                .await?;
+            let mut html = composed.html;
+            for (figure_index, figure) in composed.figures.iter().enumerate() {
+                let file_name = format!("page-{page:04}-figure-{:02}.png", figure_index + 1);
+                let figure_path = destination.join("assets/figures").join(&file_name);
+                render_pdf_region(&pdf, page, &figure.crop, &figure_path, 144)?;
+                let caption = if figure.caption.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("<figcaption>{}</figcaption>", escape_html(&figure.caption))
+                };
+                html = html.replace(
+                    &figure.marker,
+                    &format!(
+                        "<figure><img src=\"../assets/figures/{file_name}\" alt=\"{}\">{caption}</figure>",
+                        escape_html(&figure.alt)
+                    ),
+                );
+                image_count += 1;
+            }
+            page_html.insert(
+                page,
+                format!("<section class=\"pdf-page\" data-source-page=\"{page}\">{html}</section>"),
+            );
+            self.record_pdf_page_progress(
+                task_id,
+                completed + 1,
+                total_pages,
+                page,
+                composed.reused,
+            )?;
+        }
+
+        for (chapter_index, chapter) in selected.iter().enumerate() {
+            let (start, end) = parse_page_range(&chapter.source, page_count)?;
+            let body = (start..=end)
+                .filter_map(|page| page_html.get(&page))
+                .cloned()
+                .collect::<String>();
+            fs::write(
+                destination.join(format!("chapters/chapter-{:04}.html", chapter_index + 1)),
+                html_document(&chapter.title, &request.author, &body),
+            )?;
+        }
+        render_pdf_cover(&pdf, destination)?;
+        fs::write(
+            destination.join("index.html"),
+            build_index_html(&request.title, &request.author, &selected),
+        )?;
+        Ok(PreparedSource {
+            directory: destination.to_path_buf(),
+            image_count,
+            warnings: Vec::new(),
+        })
     }
 
     async fn translate_candidate(
@@ -1222,6 +1399,41 @@ impl ImportManager {
         )
     }
 
+    fn record_pdf_page_progress(
+        &self,
+        task_id: &str,
+        completed_pages: usize,
+        total_pages: usize,
+        page: usize,
+        reused: bool,
+    ) -> Result<()> {
+        let mut task = self.load_task(task_id)?;
+        let progress = 18
+            + u8::try_from(completed_pages.saturating_mul(22) / total_pages.max(1)).unwrap_or(22);
+        update_summary(
+            &mut task.summary,
+            "running",
+            "converting",
+            progress.min(40),
+            &format!("Agent 已完成 {completed_pages}/{total_pages} 个 PDF 页面"),
+            None,
+        );
+        self.save_task(&task)?;
+        self.append_event(
+            task_id,
+            "agent",
+            &format!(
+                "{} PDF 第 {page} 页（{completed_pages}/{total_pages}）",
+                if reused { "恢复" } else { "Agent 完成" }
+            ),
+            if reused {
+                "页面结构与图片区域已通过校验，复用上次检查点"
+            } else {
+                "Agent 页面结构与图片区域已通过 GoodReader 完整性校验"
+            },
+        )
+    }
+
     fn preflight_html(&self, source: &Path) -> Result<ImportPreflight> {
         let source = source.canonicalize().context("无法读取 HTML 来源目录")?;
         if !source.is_dir() {
@@ -1363,6 +1575,9 @@ impl ImportManager {
             .len(),
             character_count: all_text.chars().count(),
             requires_ocr_pages: Vec::new(),
+            uncertain_pages: Vec::new(),
+            pdf_mode: None,
+            pdf_type: None,
             dynamic_rendering: dynamic,
             warnings,
         };
@@ -1377,7 +1592,7 @@ impl ImportManager {
         Ok(preflight)
     }
 
-    fn preflight_pdf(&self, source: &Path) -> Result<ImportPreflight> {
+    fn preflight_pdf(&self, source: &Path, pdf_mode: PdfImportMode) -> Result<ImportPreflight> {
         let source = source.canonicalize().context("无法读取 PDF 文件")?;
         if source
             .extension()
@@ -1409,15 +1624,19 @@ impl ImportManager {
         }
         let text = fs::read_to_string(&text_path).unwrap_or_default();
         let pages = split_pdf_pages(&text, page_count);
-        let sparse_pages = pages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, page)| (meaningful_char_count(page) < 20).then_some(index + 1))
-            .collect::<Vec<_>>();
-        let requires_ocr_pages = if sparse_pages.len() * 3 > page_count {
-            sparse_pages.into_iter().filter(|page| *page != 1).collect()
+        let image_pages = pdf_image_pages(&snapshot_pdf).unwrap_or_default();
+        let detected_ocr_pages = pdf_pages_requiring_ocr(&pages, &image_pages);
+        let pdf_type = if detected_ocr_pages.is_empty() {
+            "digital"
+        } else if detected_ocr_pages.len() == page_count {
+            "scanned"
         } else {
-            Vec::new()
+            "mixed"
+        };
+        let (requires_ocr_pages, uncertain_pages) = match &pdf_mode {
+            PdfImportMode::Auto => (detected_ocr_pages.clone(), Vec::new()),
+            PdfImportMode::TextLayer => (Vec::new(), detected_ocr_pages.clone()),
+            PdfImportMode::Ocr => ((1..=page_count).collect(), Vec::new()),
         };
         let (language, confidence) = detect_language(&text);
         let title = pdf_info_value(&info, "Title")
@@ -1426,8 +1645,7 @@ impl ImportManager {
         let author = pdf_info_value(&info, "Author")
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "未知作者".to_string());
-        let image_pages = pdf_image_pages(&snapshot_pdf).unwrap_or_default();
-        let warnings = if requires_ocr_pages.is_empty() {
+        let mut warnings = if requires_ocr_pages.is_empty() {
             Vec::new()
         } else {
             vec![format!(
@@ -1435,6 +1653,12 @@ impl ImportManager {
                 requires_ocr_pages.len()
             )]
         };
+        if !uncertain_pages.is_empty() {
+            warnings.push(format!(
+                "已按用户选择强制使用 PDF 文本层；仍有 {} 页文本稀疏，请在生成后重点检查",
+                uncertain_pages.len()
+            ));
+        }
         let preflight = ImportPreflight {
             token: token.clone(),
             kind: ImportSourceKind::Pdf,
@@ -1456,6 +1680,9 @@ impl ImportManager {
                 .filter(|character| !character.is_whitespace())
                 .count(),
             requires_ocr_pages,
+            uncertain_pages,
+            pdf_mode: Some(pdf_mode),
+            pdf_type: Some(pdf_type.to_string()),
             dynamic_rendering: false,
             warnings,
         };
@@ -1564,11 +1791,18 @@ impl ImportManager {
     }
 
     fn live_agent_output(&self, id: &str) -> Result<Option<ImportTaskEvent>> {
-        let batches = self.root.join(id).join("translation/batches");
-        if !batches.is_dir() {
+        let task_root = self.root.join(id);
+        let translation_batches = task_root.join("translation/batches");
+        let pdf_pages = task_root.join("pdf-layout/pages");
+        let agent_workspaces = if translation_batches.is_dir() {
+            translation_batches
+        } else {
+            pdf_pages
+        };
+        if !agent_workspaces.is_dir() {
             return Ok(None);
         }
-        let mut directories = fs::read_dir(batches)?
+        let mut directories = fs::read_dir(agent_workspaces)?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| path.is_dir())
@@ -1606,10 +1840,9 @@ impl ImportManager {
             .unwrap_or_else(|| Utc::now().timestamp_millis());
         let task = self.load_task(id)?;
         let persisted = self.load_events(id)?.into_iter().rev().find(|event| {
-            event
-                .scope
-                .as_deref()
-                .is_some_and(|scope| scope.starts_with("translation.batch."))
+            event.scope.as_deref().is_some_and(|scope| {
+                scope.starts_with("translation.batch.") || scope.starts_with("pdf.page.")
+            })
         });
         let started_at = persisted
             .as_ref()
@@ -1666,7 +1899,12 @@ impl ImportManager {
 
     fn cleanup_task_outputs(&self, id: &str) -> Result<()> {
         let root = self.root.join(id);
-        for name in ["prepared-source", "candidate-books", "translation"] {
+        for name in [
+            "prepared-source",
+            "candidate-books",
+            "translation",
+            "pdf-layout",
+        ] {
             let path = root.join(name);
             if path.exists() {
                 fs::remove_dir_all(path)?;
@@ -1708,8 +1946,8 @@ fn conversion_script_description(kind: &ImportSourceKind) -> (&'static str, &'st
             "复制静态资源、移除来源脚本并转换为 GoodReader 统一结构",
         ),
         ImportSourceKind::Pdf => (
-            "执行 PDF 提取脚本",
-            "运行 pdftotext 与 pdftoppm，提取可重排正文和页面图片",
+            "启动逐页 Agent 排版",
+            "渲染页面快照，由所选 Agent 恢复阅读顺序、语义块和完整图片区域",
         ),
         ImportSourceKind::Url => (
             "执行网页静态化脚本",
@@ -1729,7 +1967,7 @@ where
 {
     match stored.preflight.kind {
         ImportSourceKind::Html => prepare_html_source(stored, request, destination),
-        ImportSourceKind::Pdf => prepare_pdf_source(stored, request, destination),
+        ImportSourceKind::Pdf => bail!("PDF 来源必须通过异步逐页 Agent 转换器处理"),
         ImportSourceKind::Url => {
             prepare_url_source_with_progress(stored, request, destination, on_online_chapter)
         }
@@ -1789,90 +2027,115 @@ fn prepare_html_source(
     })
 }
 
-fn prepare_pdf_source(
-    stored: &StoredPreflight,
-    request: &StartImportRequest,
-    destination: &Path,
-) -> Result<PreparedSource> {
-    let pdf = PathBuf::from(
-        stored
-            .source_path
-            .as_deref()
-            .context("PDF 来源快照不存在")?,
-    );
-    let text_path = pdf.parent().context("PDF 快照目录无效")?.join("source.txt");
-    let text = fs::read_to_string(&text_path).context("PDF 文本快照不存在")?;
-    let page_count = stored.preflight.page_count.context("PDF 页数缺失")?;
-    let pages = split_pdf_pages(&text, page_count);
-    fs::create_dir_all(destination.join("chapters"))?;
-    fs::create_dir_all(destination.join("assets/figures"))?;
-    let selected = request
-        .chapters
-        .iter()
-        .filter(|chapter| chapter.selected)
-        .collect::<Vec<_>>();
-    if selected.is_empty() {
-        bail!("至少保留一个章节");
+fn repeated_pdf_lines(pages: &[String]) -> HashSet<String> {
+    let mut counts = HashMap::<String, usize>::new();
+    for page in pages {
+        let lines = page
+            .lines()
+            .map(normalize_pdf_line)
+            .filter(|line| !line.is_empty() && line.chars().count() <= 120)
+            .collect::<Vec<_>>();
+        let unique = lines
+            .iter()
+            .take(3)
+            .chain(lines.iter().rev().take(3))
+            .cloned()
+            .collect::<HashSet<_>>();
+        for line in unique {
+            *counts.entry(line).or_default() += 1;
+        }
     }
-    let mut selected_pages = BTreeSet::new();
-    for chapter in &selected {
-        let (start, end) = parse_page_range(&chapter.source, page_count)?;
-        selected_pages.extend(start..=end);
-    }
-    let image_pages = pdf_image_pages(&pdf).unwrap_or_default();
-    let caption_pages = pages.iter().enumerate().filter_map(|(index, text)| {
-        let lower = text.to_ascii_lowercase();
-        (lower.contains("figure ") || text.contains('图')).then_some(index + 1)
-    });
-    let render_pages = image_pages
+    counts
         .into_iter()
-        .chain(caption_pages)
-        .filter(|page| selected_pages.contains(page))
-        .collect::<BTreeSet<_>>();
-    let mut rendered = BTreeMap::new();
-    for page in render_pages.iter().copied().take(250) {
-        let output = destination.join(format!("assets/figures/page-{page:04}"));
-        let status = Command::new(find_tool("pdftoppm")?)
-            .args([
-                "-f",
-                &page.to_string(),
-                "-l",
-                &page.to_string(),
-                "-singlefile",
-                "-r",
-                "120",
-                "-png",
-            ])
-            .arg(&pdf)
-            .arg(&output)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if status.success() {
-            rendered.insert(page, format!("../assets/figures/page-{page:04}.png"));
-        }
-    }
-    for (chapter_index, chapter) in selected.iter().enumerate() {
-        let (start, end) = parse_page_range(&chapter.source, page_count)?;
-        let mut body = String::new();
-        for page in start..=end {
-            body.push_str(&format!(
-                "<section class=\"pdf-page\" data-source-page=\"{page}\">"
-            ));
-            body.push_str(&text_to_semantic_html(&pages[page - 1]));
-            if let Some(image) = rendered.get(&page) {
-                body.push_str(&format!("<figure><img src=\"{}\" alt=\"PDF 第 {} 页视觉内容\"><figcaption>来源第 {} 页视觉内容</figcaption></figure>", image, page, page));
+        .filter_map(|(line, count)| (count >= 3).then_some(line))
+        .collect()
+}
+
+fn pdf_source_lines(text: &str, repeated_lines: &HashSet<String>) -> Vec<PdfSourceLine> {
+    let page_number = Regex::new(r"(?i)^(?:[0-9]+|[ivxlcdm]+)$").expect("页码正则固定有效");
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+        .map(|(index, text)| {
+            let normalized = normalize_pdf_line(text);
+            PdfSourceLine {
+                id: format!("l{:04}", index + 1),
+                text: text.to_string(),
+                removable: page_number.is_match(text) || repeated_lines.contains(&normalized),
             }
-            body.push_str("</section>");
-        }
-        let html = html_document(&chapter.title, &request.author, &body);
-        fs::write(
-            destination.join(format!("chapters/chapter-{:04}.html", chapter_index + 1)),
-            html,
-        )?;
+        })
+        .collect()
+}
+
+fn normalize_pdf_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn render_pdf_page(pdf: &Path, page: usize, output: &Path, dpi: usize) -> Result<()> {
+    let prefix = output.with_extension("");
+    let status = Command::new(find_tool("pdftoppm")?)
+        .args(["-f", &page.to_string(), "-l", &page.to_string()])
+        .args(["-singlefile", "-r", &dpi.to_string(), "-png"])
+        .arg(pdf)
+        .arg(&prefix)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() || !output.is_file() {
+        bail!("无法渲染 PDF 第 {page} 页供 Agent 排版");
     }
+    Ok(())
+}
+
+fn render_pdf_region(
+    pdf: &Path,
+    page: usize,
+    crop: &PdfCropBox,
+    output: &Path,
+    dpi: usize,
+) -> Result<()> {
+    let prefix = output.with_extension("");
+    let status = Command::new(find_tool("pdftoppm")?)
+        .args(["-f", &page.to_string(), "-l", &page.to_string()])
+        .args([
+            "-singlefile",
+            "-r",
+            &dpi.to_string(),
+            "-x",
+            &crop.x.to_string(),
+            "-y",
+            &crop.y.to_string(),
+            "-W",
+            &crop.width.to_string(),
+            "-H",
+            &crop.height.to_string(),
+            "-png",
+        ])
+        .arg(pdf)
+        .arg(&prefix)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() || !output.is_file() {
+        bail!("无法渲染 PDF 第 {page} 页的完整图片区域");
+    }
+    Ok(())
+}
+
+fn png_dimensions(path: &Path) -> Result<(usize, usize)> {
+    let bytes = fs::read(path).context("无法读取 PDF 页面图像")?;
+    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        bail!("PDF 页面渲染结果不是有效 PNG");
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().expect("PNG 宽度字节"));
+    let height = u32::from_be_bytes(bytes[20..24].try_into().expect("PNG 高度字节"));
+    Ok((width as usize, height as usize))
+}
+
+fn render_pdf_cover(pdf: &Path, destination: &Path) -> Result<()> {
     let cover_base = destination.join("cover");
-    let cover_status = Command::new(find_tool("pdftoppm")?)
+    let status = Command::new(find_tool("pdftoppm")?)
         .args([
             "-f",
             "1",
@@ -1885,22 +2148,15 @@ fn prepare_pdf_source(
             "-1",
             "-png",
         ])
-        .arg(&pdf)
+        .arg(pdf)
         .arg(&cover_base)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()?;
-    if !cover_status.success() {
+    if !status.success() {
         bail!("无法从 PDF 生成封面");
     }
-    let index = build_index_html(&request.title, &request.author, &selected);
-    fs::write(destination.join("index.html"), index)?;
-    Ok(PreparedSource {
-        directory: destination.to_path_buf(),
-        image_count: rendered.len(),
-        warnings: (render_pages.len() > 250)
-            .then(|| "语义图片页面超过 250 页，质量报告只渲染了前 250 页；请检查原 PDF 是否把页面背景误识别为图片".to_string())
-            .into_iter()
-            .collect(),
-    })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2571,6 +2827,18 @@ fn meaningful_char_count(text: &str) -> usize {
         .count()
 }
 
+fn pdf_pages_requiring_ocr(pages: &[String], image_pages: &BTreeSet<usize>) -> Vec<usize> {
+    pages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, page)| {
+            let page_number = index + 1;
+            (meaningful_char_count(page) < 20 && image_pages.contains(&page_number))
+                .then_some(page_number)
+        })
+        .collect()
+}
+
 fn pdf_image_pages(pdf: &Path) -> Result<BTreeSet<usize>> {
     let output = command_text(
         &find_tool("pdfimages")?,
@@ -2623,8 +2891,12 @@ fn detect_pdf_chapters(pages: &[String], fallback_title: &str) -> Vec<ImportChap
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .take(12)
-            .find(|line| line.chars().count() <= 100 && heading.is_match(line));
+            .take(40)
+            .find(|line| {
+                line.chars().count() <= 100
+                    && heading.is_match(line)
+                    && is_complete_pdf_heading(line)
+            });
         if let Some(title) = candidate {
             if let Some(ordinal) = chapter_ordinal(title) {
                 if detected
@@ -2670,6 +2942,14 @@ fn detect_pdf_chapters(pages: &[String], fallback_title: &str) -> Vec<ImportChap
             }
         })
         .collect()
+}
+
+fn is_complete_pdf_heading(value: &str) -> bool {
+    let pairs = [('(', ')'), ('（', '）'), ('[', ']'), ('【', '】')];
+    pairs.iter().all(|(open, close)| {
+        value.chars().filter(|character| character == open).count()
+            == value.chars().filter(|character| character == close).count()
+    })
 }
 
 fn coherent_chapter_sequence(detected: &[(usize, String, usize)]) -> Vec<(usize, String)> {
@@ -2783,47 +3063,9 @@ fn parse_chinese_number(value: &str) -> Option<usize> {
     (total > 0).then_some(total)
 }
 
-fn text_to_semantic_html(text: &str) -> String {
-    let mut output = String::new();
-    let mut paragraph = Vec::new();
-    let flush = |paragraph: &mut Vec<String>, output: &mut String| {
-        if paragraph.is_empty() {
-            return;
-        }
-        let joined = paragraph.join(" ");
-        let trimmed = joined.trim();
-        if trimmed.is_empty() {
-            paragraph.clear();
-            return;
-        }
-        let heading = trimmed.chars().count() <= 72
-            && (trimmed.starts_with("Chapter ")
-                || trimmed.starts_with("CHAPTER ")
-                || Regex::new(r"^第\s*[一二三四五六七八九十百0-9]+\s*章")
-                    .expect("章节正则固定有效")
-                    .is_match(trimmed));
-        let tag = if heading { "h2" } else { "p" };
-        output.push_str(&format!("<{tag}>{}</{tag}>", escape_html(trimmed)));
-        paragraph.clear();
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            flush(&mut paragraph, &mut output);
-        } else {
-            paragraph.push(line.to_string());
-        }
-    }
-    flush(&mut paragraph, &mut output);
-    if output.is_empty() {
-        output.push_str("<p>本页没有可提取的文本内容。</p>");
-    }
-    output
-}
-
 fn html_document(title: &str, author: &str, body: &str) -> String {
     format!(
-        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"author\" content=\"{}\"><title>{}</title><style>body{{max-width:760px;margin:auto;padding:48px 28px;line-height:1.8}}img{{max-width:100%;height:auto}}figure{{margin:2em 0}}figcaption{{color:#777;text-align:center}}</style></head><body><h1>{}</h1>{}</body></html>",
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"author\" content=\"{}\"><title>{}</title><style>body{{max-width:760px;margin:auto;padding:48px 28px;line-height:1.8}}img{{max-width:100%;height:auto}}figure{{margin:2em 0}}figcaption{{color:#777;text-align:center}}.pdf-toc ol{{list-style:none;margin:0;padding:0}}.pdf-toc li{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:1rem;padding:.35rem 0;border-bottom:1px dotted color-mix(in srgb,currentColor 24%,transparent)}}.pdf-toc-title{{min-width:0;overflow-wrap:anywhere}}.pdf-toc-page{{font-variant-numeric:tabular-nums;color:#777}}</style></head><body><h1>{}</h1>{}</body></html>",
         escape_html(author),
         escape_html(title),
         escape_html(title),
@@ -3616,12 +3858,15 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        detect_language, discover_chapter_links, text_to_semantic_html, validate_translation_map,
-        ImportManager,
+        detect_language, detect_pdf_chapters, discover_chapter_links, pdf_pages_requiring_ocr,
+        validate_translation_map, ImportManager,
     };
     use crate::agent::AgentCoordinator;
     use crate::db::Database;
-    use crate::models::{ImportSourceKind, StartImportRequest};
+    use crate::models::{
+        ImportChapterCandidate, ImportPreflight, ImportSourceKind, PdfImportMode,
+        StartImportRequest,
+    };
 
     #[test]
     fn detects_the_main_narrative_language() {
@@ -3715,12 +3960,96 @@ mod tests {
     }
 
     #[test]
-    fn pdf_text_becomes_reflowable_blocks() {
-        let html =
-            text_to_semantic_html("第 1 章 开始\n\n第一段正文。\n继续这一段。\n\n第二段正文。");
-        assert!(html.contains("<h2>第 1 章 开始</h2>"));
-        assert!(html.contains("<p>第一段正文。 继续这一段。</p>"));
-        assert!(!html.contains("position:absolute"));
+    fn pdf_chapter_detection_rejects_truncated_table_headings() {
+        let pages = vec![
+            "1.3 本章小结\n第二章（上下文工\n其他表格内容".to_string(),
+            "第 2 章 上下文工程\n本章正文".to_string(),
+            "第 3 章 用户记忆和知识库\n本章正文".to_string(),
+            "第 4 章 工具\n本章正文".to_string(),
+        ];
+
+        let chapters = detect_pdf_chapters(&pages, "示例书");
+        assert!(!chapters
+            .iter()
+            .any(|chapter| chapter.title == "第二章（上下文工"));
+        assert!(chapters
+            .iter()
+            .any(|chapter| chapter.title == "第 2 章 上下文工程"));
+    }
+
+    #[test]
+    fn mixed_pdf_reports_each_sparse_image_page_for_ocr() {
+        let pages = vec![
+            "第一页有完整的数字文本内容，足以证明文本层可用。".to_string(),
+            String::new(),
+            "第三页也有完整的数字文本内容，不能因为扫描页占比低就忽略。".to_string(),
+        ];
+        let image_pages = std::collections::BTreeSet::from([2usize]);
+
+        assert_eq!(pdf_pages_requiring_ocr(&pages, &image_pages), vec![2]);
+    }
+
+    #[test]
+    fn chinese_pdf_still_requires_a_page_layout_agent() {
+        let temp = TempDir::new().expect("临时目录");
+        let database = Arc::new(Database::open(&temp.path().join("Data")).unwrap());
+        let agent =
+            Arc::new(AgentCoordinator::new(temp.path().join("AgentTasks"), database).unwrap());
+        let manager = Arc::new(
+            ImportManager::new(
+                temp.path().join("ImportTasks"),
+                temp.path().join("Books"),
+                agent,
+            )
+            .unwrap(),
+        );
+        let token = uuid::Uuid::new_v4().to_string();
+        let chapter = ImportChapterCandidate {
+            id: "candidate-0001".to_string(),
+            title: "第一章".to_string(),
+            source: "pages:1-1".to_string(),
+            selected: true,
+        };
+        let stored = super::StoredPreflight {
+            preflight: ImportPreflight {
+                token: token.clone(),
+                kind: ImportSourceKind::Pdf,
+                source_name: "示例.pdf".to_string(),
+                title: "示例".to_string(),
+                original_title: "示例".to_string(),
+                author: "作者".to_string(),
+                language: "zh-CN".to_string(),
+                language_confidence: "high".to_string(),
+                page_count: Some(1),
+                chapter_candidates: vec![chapter.clone()],
+                image_count: 0,
+                character_count: 100,
+                requires_ocr_pages: Vec::new(),
+                uncertain_pages: Vec::new(),
+                pdf_mode: Some(PdfImportMode::TextLayer),
+                pdf_type: Some("digital".to_string()),
+                dynamic_rendering: false,
+                warnings: Vec::new(),
+            },
+            source_path: Some("/tmp/example.pdf".to_string()),
+            source_url: None,
+        };
+        let workspace = temp.path().join("ImportTasks").join(&token);
+        fs::create_dir_all(&workspace).unwrap();
+        super::write_json(&workspace.join("preflight.json"), &stored).unwrap();
+
+        let error = manager
+            .start(StartImportRequest {
+                token,
+                title: "示例".to_string(),
+                author: "作者".to_string(),
+                chapters: vec![chapter],
+                translate: false,
+                preserve_original: false,
+                runtime_id: None,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("PDF 制书必须选择一个可用 Agent"));
     }
 
     #[test]
@@ -4405,23 +4734,24 @@ printf 'done\n'
 
     #[test]
     #[ignore = "需要未纳入版本管理的本地中文数字 PDF"]
-    fn converts_a_real_digital_pdf_into_a_valid_candidate_book() {
+    fn requires_an_agent_for_a_real_digital_pdf() {
         let temp = TempDir::new().expect("临时目录");
         let database = Arc::new(Database::open(&temp.path().join("Data")).unwrap());
         let agent =
             Arc::new(AgentCoordinator::new(temp.path().join("AgentTasks"), database).unwrap());
-        let manager = ImportManager::new(
-            temp.path().join("ImportTasks"),
-            temp.path().join("Books"),
-            agent,
-        )
-        .unwrap();
+        let manager = Arc::new(
+            ImportManager::new(
+                temp.path().join("ImportTasks"),
+                temp.path().join("Books"),
+                agent,
+            )
+            .unwrap(),
+        );
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../AI-Agents-in-Depth-zh-CN.pdf");
         let preflight = manager
             .preflight_local(ImportSourceKind::Pdf, &source)
             .unwrap();
-        let stored = manager.load_preflight(&preflight.token).unwrap();
         let request = StartImportRequest {
             token: preflight.token,
             title: preflight.title,
@@ -4431,16 +4761,8 @@ printf 'done\n'
             preserve_original: false,
             runtime_id: None,
         };
-        let prepared =
-            super::prepare_pdf_source(&stored, &request, &temp.path().join("prepared")).unwrap();
-        let candidate_books = temp.path().join("candidates");
-        let imported =
-            crate::importer::import_html_directory(&prepared.directory, &candidate_books).unwrap();
-        let candidate = super::only_child_directory(&candidate_books).unwrap();
-        let package = crate::library::validate_package(&candidate).unwrap();
-        assert_eq!(imported.chapter_count, request.chapters.len());
-        assert!(package.manifest.chapters.len() >= 2);
-        assert!(prepared.image_count >= 1);
+        let error = manager.start(request).unwrap_err();
+        assert!(error.to_string().contains("PDF 制书必须选择一个可用 Agent"));
     }
 
     #[tokio::test]
@@ -4541,6 +4863,9 @@ printf 'done\n'
                 image_count: 0,
                 character_count: 20,
                 requires_ocr_pages: Vec::new(),
+                uncertain_pages: Vec::new(),
+                pdf_mode: None,
+                pdf_type: None,
                 dynamic_rendering: false,
                 warnings: Vec::new(),
             },
@@ -4666,6 +4991,9 @@ printf 'done\n'
                 image_count: 1,
                 character_count: 20,
                 requires_ocr_pages: Vec::new(),
+                uncertain_pages: Vec::new(),
+                pdf_mode: None,
+                pdf_type: None,
                 dynamic_rendering: false,
                 warnings: Vec::new(),
             },

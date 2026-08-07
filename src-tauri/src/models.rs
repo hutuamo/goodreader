@@ -175,6 +175,13 @@ pub struct Bootstrap {
     pub library_path: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceCoverResponse {
+    pub changed: bool,
+    pub bootstrap: Bootstrap,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedBookSummary {
@@ -200,12 +207,23 @@ pub enum ImportSourceKind {
     Url,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PdfImportMode {
+    #[default]
+    Auto,
+    TextLayer,
+    Ocr,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImportPreflightRequest {
     pub kind: ImportSourceKind,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub pdf_mode: PdfImportMode,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -224,6 +242,12 @@ pub struct ImportPreflight {
     pub image_count: usize,
     pub character_count: usize,
     pub requires_ocr_pages: Vec<usize>,
+    #[serde(default)]
+    pub uncertain_pages: Vec<usize>,
+    #[serde(default)]
+    pub pdf_mode: Option<PdfImportMode>,
+    #[serde(default)]
+    pub pdf_type: Option<String>,
     pub dynamic_rendering: bool,
     pub warnings: Vec<String>,
 }
@@ -432,6 +456,20 @@ pub struct AgentTask {
     pub current_runtime_id: String,
     pub error: Option<String>,
     pub created_at: i64,
+    pub updated_at: i64,
+    pub phase: Option<String>,
+    pub partial_output: Option<String>,
+    pub stream_sequence: Option<u64>,
+    pub execution_id: Option<String>,
+    pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSession {
+    pub book_id: String,
+    pub runtime_id: String,
+    pub provider_session_id: String,
+    pub provider_state_json: String,
     pub updated_at: i64,
 }
 

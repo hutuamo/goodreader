@@ -33,5 +33,20 @@ if (!source.includes("afterSeq=") || !source.includes("importTaskEventCache")) {
 if (!source.includes("importTaskDetailsSummary") || !source.includes("预计剩余")) {
   throw new Error("生成详情缺少正文块、耗时和 ETA 摘要");
 }
+if (!source.includes('name="pdfMode" value="auto"')
+  || !source.includes('name="pdfMode" value="text-layer"')
+  || !source.includes('name="pdfMode" value="ocr"')) {
+  throw new Error("PDF 导入缺少自动、文本层和 OCR 三种明确模式");
+}
+if (!source.includes("body: JSON.stringify({ kind: \"pdf\", pdfMode })")) {
+  throw new Error("PDF 导入模式没有传递到后端预检");
+}
+if (!source.includes('const needsLayoutAgent = preflight.kind === "pdf"')
+  || !source.includes("needsLayoutAgent || translate?.checked")) {
+  throw new Error("PDF 导入没有强制选择逐页排版 Agent");
+}
+if (!source.includes("逐页调用 Agent 恢复阅读顺序、书籍排版和完整图片区域")) {
+  throw new Error("PDF 导入没有向用户说明逐页 Agent 排版工作量");
+}
 
-console.log("导入进度窗口稳定刷新，并具备增量事件与可度量详情摘要");
+console.log("导入进度窗口稳定刷新，PDF 模式选择、逐页 Agent 排版与增量详情均已接通");

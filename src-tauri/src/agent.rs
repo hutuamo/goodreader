@@ -3,15 +3,21 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::broadcast;
 
+use crate::agent_session::{
+    AgentSessionHost, ExecutionControl, ProviderExecutionEvent, ProviderKind, SessionConfig,
+    SessionKey,
+};
 use crate::db::Database;
 use crate::library::resolve_package_file;
 use crate::models::{
@@ -20,6 +26,7 @@ use crate::models::{
 };
 
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(60 * 30);
+const NETWORK_FAILURE_TIMEOUT: Duration = Duration::from_secs(90);
 const TRANSLATION_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60 * 8);
 const MAX_INVALID_STRUCTURED_OUTPUTS: usize = 2;
 
@@ -28,12 +35,51 @@ pub struct AgentCoordinator {
     tasks_dir: PathBuf,
     database: Arc<Database>,
     active_processes: Arc<Mutex<HashMap<PathBuf, u32>>>,
+    active_questions: Arc<Mutex<HashMap<String, ExecutionControl>>>,
+    live_tasks: Arc<Mutex<HashMap<String, LiveTaskState>>>,
+    sessions: AgentSessionHost,
+    task_updates: broadcast::Sender<AgentTaskStreamEvent>,
+}
+
+#[derive(Clone, Default)]
+struct LiveTaskState {
+    phase: Option<String>,
+    partial_output: String,
+    stream_sequence: u64,
+    execution_id: Option<String>,
+    turn_id: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AgentTaskStreamEvent {
+    Snapshot {
+        task: AgentTask,
+    },
+    Provider {
+        task_id: String,
+        event: ProviderExecutionEvent,
+    },
+}
+
+impl AgentTaskStreamEvent {
+    pub fn task_id(&self) -> &str {
+        match self {
+            Self::Snapshot { task } => &task.id,
+            Self::Provider { task_id, .. } => task_id,
+        }
+    }
 }
 
 #[derive(Clone)]
 enum RuntimeKind {
     Codex,
     Claude,
+    OpenCode,
     Cursor,
     Custom,
 }
@@ -81,11 +127,24 @@ impl AgentCoordinator {
     pub fn new(tasks_dir: PathBuf, database: Arc<Database>) -> Result<Self> {
         fs::create_dir_all(&tasks_dir)
             .with_context(|| format!("无法创建 Agent 任务目录 {}", tasks_dir.display()))?;
+        let (task_updates, _) = broadcast::channel(256);
         Ok(Self {
             tasks_dir,
             database,
             active_processes: Arc::new(Mutex::new(HashMap::new())),
+            active_questions: Arc::new(Mutex::new(HashMap::new())),
+            live_tasks: Arc::new(Mutex::new(HashMap::new())),
+            sessions: AgentSessionHost::new(),
+            task_updates,
         })
+    }
+
+    pub fn subscribe_task_updates(&self) -> broadcast::Receiver<AgentTaskStreamEvent> {
+        self.task_updates.subscribe()
+    }
+
+    pub async fn dispose_book_sessions(&self, book_id: &str) {
+        self.sessions.dispose_book(book_id).await;
     }
 
     pub async fn runtimes(&self) -> Result<Vec<AgentRuntime>> {
@@ -101,20 +160,30 @@ impl AgentCoordinator {
         for custom in self.database.custom_agent_runtimes()? {
             let path = PathBuf::from(&custom.executable);
             let available = is_executable_file(&path);
+            let kind = custom_runtime_kind(&path);
+            let version = if available && matches!(kind, RuntimeKind::OpenCode) {
+                probe_version(&path, &kind).await.ok()
+            } else {
+                None
+            };
             runtimes.push(AgentRuntime {
                 id: custom.id,
                 name: custom.name,
                 executable: Some(custom.executable),
                 available,
-                version: None,
+                version,
                 detail: (!available).then(|| "找不到可执行文件".to_string()),
                 built_in: false,
-                capabilities: AgentRuntimeCapabilities {
-                    streaming: false,
-                    native_resume: false,
-                    structured_output: false,
-                    permission_mapping: false,
-                    tool_use: false,
+                capabilities: if matches!(kind, RuntimeKind::OpenCode) {
+                    builtin_capabilities(&kind)
+                } else {
+                    AgentRuntimeCapabilities {
+                        streaming: false,
+                        native_resume: false,
+                        structured_output: false,
+                        permission_mapping: false,
+                        tool_use: false,
+                    }
                 },
             });
         }
@@ -150,7 +219,10 @@ impl AgentCoordinator {
         source_language: &str,
     ) -> Result<TranslationRun> {
         let runtime = self.runtime_spec(runtime_id)?;
-        if matches!(runtime.kind, RuntimeKind::Custom | RuntimeKind::Cursor) {
+        if matches!(
+            runtime.kind,
+            RuntimeKind::Custom | RuntimeKind::Cursor | RuntimeKind::OpenCode
+        ) {
             let instruction = format!(
                 "请读取 input/blocks.json，{}\n把最终 JSON 对象写入 output/translations.json；只修改这个输出文件。",
                 translation_instruction(source_language)
@@ -264,7 +336,7 @@ impl AgentCoordinator {
                 command.arg("-");
                 true
             }
-            RuntimeKind::Cursor | RuntimeKind::Custom => false,
+            RuntimeKind::OpenCode | RuntimeKind::Cursor | RuntimeKind::Custom => false,
         };
         let started = std::time::Instant::now();
         let runtime_output = if matches!(runtime.kind, RuntimeKind::Claude) {
@@ -302,7 +374,7 @@ impl AgentCoordinator {
                     value,
                 )
             }
-            RuntimeKind::Cursor | RuntimeKind::Custom => unreachable!(),
+            RuntimeKind::OpenCode | RuntimeKind::Cursor | RuntimeKind::Custom => unreachable!(),
         };
         write_json(&output.join("translations.json"), &structured.translations)?;
         Ok(TranslationRun {
@@ -340,18 +412,112 @@ impl AgentCoordinator {
         annotations: Vec<Annotation>,
         task: AgentTask,
     ) {
+        let control = ExecutionControl::new();
+        self.active_questions
+            .lock()
+            .expect("Agent 问题控制锁")
+            .insert(task.id.clone(), control.clone());
+        self.live_tasks.lock().expect("Agent 实时状态锁").insert(
+            task.id.clone(),
+            LiveTaskState {
+                phase: Some("等待 Agent 启动".to_string()),
+                partial_output: String::new(),
+                stream_sequence: 0,
+                execution_id: None,
+                turn_id: None,
+            },
+        );
+        self.publish_task(&task.id);
         let coordinator = self.clone();
         tokio::spawn(async move {
             if let Err(error) = coordinator
-                .execute_question(&package, &annotations, &task)
+                .execute_question(&package, &annotations, &task, &control)
                 .await
             {
-                let _ = coordinator.database.pause_agent_execution(
-                    &task.id,
-                    None,
-                    &friendly_error(&error),
-                );
+                if !coordinator
+                    .database
+                    .agent_task(&task.id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|current| current.status == "stopped")
+                {
+                    let _ = coordinator.database.pause_agent_execution(
+                        &task.id,
+                        None,
+                        &friendly_error(&error),
+                    );
+                }
             }
+            coordinator.publish_task(&task.id);
+            coordinator
+                .active_questions
+                .lock()
+                .expect("Agent 问题控制锁")
+                .remove(&task.id);
+            coordinator
+                .live_tasks
+                .lock()
+                .expect("Agent 实时状态锁")
+                .remove(&task.id);
+            coordinator.publish_task(&task.id);
+        });
+    }
+
+    pub fn stop_question(&self, task_id: &str) -> Result<AgentTask> {
+        let task = self.database.stop_agent_task(task_id)?;
+        if let Some(control) = self
+            .active_questions
+            .lock()
+            .expect("Agent 问题控制锁")
+            .get(task_id)
+            .cloned()
+        {
+            control.cancel();
+        }
+        let workspace = self.tasks_dir.join(task_id);
+        if let Some(pid) = self
+            .active_processes
+            .lock()
+            .expect("Agent 活动进程锁")
+            .get(&workspace)
+            .copied()
+        {
+            terminate_process_group(pid);
+        }
+        self.publish_task(task_id);
+        Ok(task)
+    }
+
+    pub fn decorate_task(&self, mut task: AgentTask) -> AgentTask {
+        if let Some(live) = self
+            .live_tasks
+            .lock()
+            .expect("Agent 实时状态锁")
+            .get(&task.id)
+            .cloned()
+        {
+            task.phase = live.phase;
+            task.partial_output = (!live.partial_output.is_empty()).then_some(live.partial_output);
+            task.stream_sequence = Some(live.stream_sequence);
+            task.execution_id = live.execution_id;
+            task.turn_id = live.turn_id;
+        }
+        task
+    }
+
+    pub fn decorate_tasks(&self, tasks: Vec<AgentTask>) -> Vec<AgentTask> {
+        tasks
+            .into_iter()
+            .map(|task| self.decorate_task(task))
+            .collect()
+    }
+
+    fn publish_task(&self, task_id: &str) {
+        let Ok(Some(task)) = self.database.agent_task(task_id) else {
+            return;
+        };
+        let _ = self.task_updates.send(AgentTaskStreamEvent::Snapshot {
+            task: self.decorate_task(task),
         });
     }
 
@@ -360,6 +526,7 @@ impl AgentCoordinator {
         package: &BookPackage,
         annotations: &[Annotation],
         task: &AgentTask,
+        control: &ExecutionControl,
     ) -> Result<()> {
         let runtime = self.runtime_spec(&task.current_runtime_id)?;
         let execution_id = self.database.start_agent_execution(&task.id, &runtime.id)?;
@@ -367,7 +534,31 @@ impl AgentCoordinator {
         let result = async {
             let history = self.database.ai_messages(&task.book_id)?;
             let workspace = self.prepare_workspace(package, annotations, task, &history)?;
-            let output = run_runtime(&runtime, &workspace).await?;
+            if self
+                .database
+                .agent_task(&task.id)?
+                .is_some_and(|current| current.status == "stopped")
+            {
+                bail!("Agent 任务已停止");
+            }
+            let output = if matches!(
+                runtime.kind,
+                RuntimeKind::Codex | RuntimeKind::Claude | RuntimeKind::OpenCode
+            ) {
+                self.run_native_question(&runtime, task, &workspace, control)
+                    .await?
+            } else {
+                let output = run_runtime(&runtime, &workspace, &self.active_processes).await?;
+                if let Some(live) = self
+                    .live_tasks
+                    .lock()
+                    .expect("Agent 实时状态锁")
+                    .get_mut(&task.id)
+                {
+                    live.partial_output = output.answer.clone();
+                }
+                output
+            };
             write_execution_log(&workspace, &execution_id, &output)?;
             self.database.complete_agent_execution(
                 &task.id,
@@ -380,14 +571,141 @@ impl AgentCoordinator {
         .await;
 
         if let Err(error) = result {
-            self.database.pause_agent_execution(
-                &task.id,
-                Some(&execution_id),
-                &friendly_error(&error),
-            )?;
+            if !self
+                .database
+                .agent_task(&task.id)?
+                .is_some_and(|current| current.status == "stopped")
+            {
+                self.database.pause_agent_execution(
+                    &task.id,
+                    Some(&execution_id),
+                    &friendly_error(&error),
+                )?;
+            }
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn run_native_question(
+        &self,
+        runtime: &RuntimeSpec,
+        task: &AgentTask,
+        workspace: &Path,
+        control: &ExecutionControl,
+    ) -> Result<RuntimeOutput> {
+        let session = self.database.agent_session(&task.book_id, &runtime.id)?;
+        let events_path = workspace.join("logs/events.jsonl");
+        let mut events_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&events_path)
+            .with_context(|| format!("无法创建 Agent 事件日志 {}", events_path.display()))?;
+        let provider_kind = match runtime.kind {
+            RuntimeKind::Codex => ProviderKind::Codex,
+            RuntimeKind::Claude => ProviderKind::Claude,
+            RuntimeKind::OpenCode => ProviderKind::OpenCode,
+            RuntimeKind::Cursor | RuntimeKind::Custom => unreachable!(),
+        };
+        let config = SessionConfig {
+            key: SessionKey {
+                book_id: task.book_id.clone(),
+                runtime_id: runtime.id.clone(),
+            },
+            provider: provider_kind,
+            executable: runtime.executable.clone(),
+            arguments: runtime.arguments.clone(),
+            workspace: workspace.to_path_buf(),
+            resume_session_id: session.map(|value| value.provider_session_id),
+        };
+        let instruction = "请阅读 context/current.md，并完成其中的 GoodReader 书籍问答任务。";
+        let mut run = self
+            .sessions
+            .execute(config, instruction.to_string(), control.clone());
+        {
+            let mut tasks = self.live_tasks.lock().expect("Agent 实时状态锁");
+            if let Some(live) = tasks.get_mut(&task.id) {
+                live.execution_id = Some(run.execution_id.clone());
+                live.turn_id = Some(run.turn_id.clone());
+            }
+        }
+        self.active_questions
+            .lock()
+            .expect("Agent 问题控制锁")
+            .insert(task.id.clone(), run.control());
+        self.publish_task(&task.id);
+        while let Some(event) = run.events.recv().await {
+            if let Ok(line) = serde_json::to_string(&event) {
+                use std::io::Write;
+                let _ = writeln!(events_file, "{line}");
+                let _ = events_file.flush();
+            }
+            {
+                let mut tasks = self.live_tasks.lock().expect("Agent 实时状态锁");
+                if let Some(live) = tasks.get_mut(&task.id) {
+                    live.stream_sequence = event.scope().sequence;
+                    match &event {
+                        ProviderExecutionEvent::Phase { label, .. } => {
+                            live.phase = Some(label.clone());
+                        }
+                        ProviderExecutionEvent::TextDelta { text, .. } => {
+                            live.partial_output.push_str(text);
+                        }
+                        ProviderExecutionEvent::ToolStarted { name, .. } => {
+                            live.phase = Some(format!("Agent 正在使用{name}"));
+                        }
+                        ProviderExecutionEvent::ToolCompleted { .. } => {
+                            live.phase = Some("Agent 正在组织回答".to_string());
+                        }
+                        ProviderExecutionEvent::TurnCompleted { .. } => {
+                            live.phase = Some("回答完成".to_string());
+                        }
+                        ProviderExecutionEvent::Cancelled { .. } => {
+                            live.phase = Some("请求已停止".to_string());
+                        }
+                        ProviderExecutionEvent::ExecutionError { message, .. } => {
+                            live.phase = Some(message.clone());
+                        }
+                        ProviderExecutionEvent::TurnStarted { .. }
+                        | ProviderExecutionEvent::SessionStateChanged { .. }
+                        | ProviderExecutionEvent::ThinkingDelta { .. } => {}
+                    }
+                }
+            }
+            if let ProviderExecutionEvent::SessionStateChanged {
+                provider_session_id,
+                model,
+                ..
+            } = &event
+            {
+                let state = serde_json::json!({ "model": model });
+                self.database.save_agent_session(
+                    &task.book_id,
+                    &runtime.id,
+                    provider_session_id,
+                    &state.to_string(),
+                )?;
+            }
+            let _ = self.task_updates.send(AgentTaskStreamEvent::Provider {
+                task_id: task.id.clone(),
+                event,
+            });
+        }
+        let provider = run.finish().await?;
+        if let Some(session_id) = provider.session_id.as_deref() {
+            let state = serde_json::json!({ "model": provider.model });
+            self.database.save_agent_session(
+                &task.book_id,
+                &runtime.id,
+                session_id,
+                &serde_json::to_string(&state)?,
+            )?;
+        }
+        Ok(RuntimeOutput {
+            answer: provider.answer,
+            stdout: provider.transcript,
+            stderr: provider.stderr,
+        })
     }
 
     fn runtime_spec(&self, runtime_id: &str) -> Result<RuntimeSpec> {
@@ -424,7 +742,17 @@ impl AgentCoordinator {
         task: &AgentTask,
         history: &[AiMessage],
     ) -> Result<PathBuf> {
-        let workspace = self.tasks_dir.join(&task.id);
+        let session_directory = task
+            .book_id
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let workspace = self
+            .tasks_dir
+            .join("Sessions")
+            .join(session_directory)
+            .join("workspace");
         let context_dir = workspace.join("context");
         let book_dir = workspace.join("book");
         let chapters_dir = book_dir.join("chapters");
@@ -499,8 +827,16 @@ fn custom_runtime_spec(custom: CustomAgentRuntime) -> Result<RuntimeSpec> {
         id: custom.id,
         executable,
         arguments: custom.arguments,
-        kind: RuntimeKind::Custom,
+        kind: custom_runtime_kind(Path::new(&custom.executable)),
     })
+}
+
+fn custom_runtime_kind(executable: &Path) -> RuntimeKind {
+    if executable.file_name().and_then(|name| name.to_str()) == Some("opencode") {
+        RuntimeKind::OpenCode
+    } else {
+        RuntimeKind::Custom
+    }
 }
 
 async fn probe_builtin(
@@ -538,8 +874,14 @@ async fn probe_builtin(
 fn builtin_capabilities(kind: &RuntimeKind) -> AgentRuntimeCapabilities {
     let structured = matches!(kind, RuntimeKind::Claude | RuntimeKind::Codex);
     AgentRuntimeCapabilities {
-        streaming: structured,
-        native_resume: false,
+        streaming: matches!(
+            kind,
+            RuntimeKind::Claude | RuntimeKind::Codex | RuntimeKind::OpenCode
+        ),
+        native_resume: matches!(
+            kind,
+            RuntimeKind::Claude | RuntimeKind::Codex | RuntimeKind::OpenCode
+        ),
         structured_output: structured,
         permission_mapping: true,
         tool_use: true,
@@ -570,9 +912,21 @@ async fn probe_version(executable: &Path, kind: &RuntimeKind) -> Result<String> 
     Ok(version.lines().next().unwrap_or_default().to_string())
 }
 
-async fn run_runtime(runtime: &RuntimeSpec, workspace: &Path) -> Result<RuntimeOutput> {
+async fn run_runtime(
+    runtime: &RuntimeSpec,
+    workspace: &Path,
+    active_processes: &Arc<Mutex<HashMap<PathBuf, u32>>>,
+) -> Result<RuntimeOutput> {
     let instruction = "请阅读 context/current.md，并完成其中的 GoodReader 书籍问答任务。";
-    run_runtime_instruction(runtime, workspace, instruction, false, None, None).await
+    run_runtime_instruction(
+        runtime,
+        workspace,
+        instruction,
+        false,
+        None,
+        Some(active_processes),
+    )
+    .await
 }
 
 async fn run_runtime_instruction(
@@ -614,6 +968,12 @@ async fn run_runtime_instruction(
             });
             true
         }
+        RuntimeKind::OpenCode => {
+            command.args(["run", "--format", "json"]);
+            command.args(&runtime.arguments);
+            command.arg(instruction);
+            false
+        }
         RuntimeKind::Cursor => {
             command.args([
                 "agent",
@@ -634,7 +994,7 @@ async fn run_runtime_instruction(
         }
     };
 
-    execute_command(
+    let mut output = execute_command(
         command,
         workspace,
         instruction,
@@ -642,16 +1002,63 @@ async fn run_runtime_instruction(
         live_logs,
         active_processes,
     )
-    .await
+    .await?;
+    if matches!(runtime.kind, RuntimeKind::OpenCode) {
+        output.answer = parse_opencode_answer(&output.stdout)?;
+    }
+    Ok(output)
+}
+
+fn parse_opencode_answer(output: &str) -> Result<String> {
+    let mut answer = String::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("OpenCode 返回了无效 JSON 事件：{}", truncate(line, 200)))?;
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+            if let Some(text) = value
+                .pointer("/part/text")
+                .and_then(serde_json::Value::as_str)
+            {
+                answer.push_str(text);
+            }
+        }
+    }
+    if answer.trim().is_empty() {
+        bail!("OpenCode 没有返回回答");
+    }
+    Ok(answer.trim().to_string())
 }
 
 async fn execute_command(
+    command: Command,
+    workspace: &Path,
+    instruction: &str,
+    uses_stdin: bool,
+    live_logs: Option<&Path>,
+    active_processes: Option<&Arc<Mutex<HashMap<PathBuf, u32>>>>,
+) -> Result<RuntimeOutput> {
+    execute_command_with_limits(
+        command,
+        workspace,
+        instruction,
+        uses_stdin,
+        live_logs,
+        active_processes,
+        EXECUTION_TIMEOUT,
+        NETWORK_FAILURE_TIMEOUT,
+    )
+    .await
+}
+
+async fn execute_command_with_limits(
     mut command: Command,
     workspace: &Path,
     instruction: &str,
     uses_stdin: bool,
     live_logs: Option<&Path>,
     active_processes: Option<&Arc<Mutex<HashMap<PathBuf, u32>>>>,
+    execution_timeout: Duration,
+    network_failure_timeout: Duration,
 ) -> Result<RuntimeOutput> {
     #[cfg(unix)]
     {
@@ -673,8 +1080,19 @@ async fn execute_command(
     let stderr = child.stderr.take().context("无法读取 Agent 错误输出")?;
     let stdout_log = live_logs.map(|logs| logs.join("stdout.log"));
     let stderr_log = live_logs.map(|logs| logs.join("stderr.log"));
-    let stdout_task = tokio::spawn(capture_runtime_stream(stdout, stdout_log));
-    let stderr_task = tokio::spawn(capture_runtime_stream(stderr, stderr_log));
+    let network_failure = Arc::new(AtomicBool::new(false));
+    let stdout_task = tokio::spawn(capture_runtime_stream(
+        stdout,
+        stdout_log,
+        Some(network_failure.clone()),
+        true,
+    ));
+    let stderr_task = tokio::spawn(capture_runtime_stream(
+        stderr,
+        stderr_log,
+        Some(network_failure.clone()),
+        false,
+    ));
     if uses_stdin {
         let mut stdin = child.stdin.take().context("无法连接 Agent 标准输入")?;
         stdin.write_all(instruction.as_bytes()).await?;
@@ -682,16 +1100,46 @@ async fn execute_command(
         drop(stdin);
     }
 
-    let status = match tokio::time::timeout(EXECUTION_TIMEOUT, child.wait()).await {
-        Ok(status) => status?,
-        Err(_) => {
-            terminate_process_group(pid);
-            let _ = child.kill().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            finish_process_tracking(workspace, live_logs, active_processes);
-            bail!("Agent 执行超过 30 分钟");
+    let started = Instant::now();
+    let mut network_failure_started = None;
+    let mut forced_error = None;
+    let mut monitor = tokio::time::interval(Duration::from_millis(50));
+    monitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break Some(status?),
+            _ = monitor.tick() => {
+                if network_failure.load(Ordering::Relaxed) && network_failure_started.is_none() {
+                    network_failure_started = Some(Instant::now());
+                } else if !network_failure.load(Ordering::Relaxed) {
+                    network_failure_started = None;
+                }
+                if network_failure_started
+                    .is_some_and(|since: Instant| since.elapsed() >= network_failure_timeout)
+                {
+                    forced_error = Some(format!(
+                        "Agent 网络连接持续失败超过 {} 秒，请检查当前 CLI 的网络连接后重试",
+                        network_failure_timeout.as_secs()
+                    ));
+                    break None;
+                }
+                if started.elapsed() >= execution_timeout {
+                    forced_error = Some(format!(
+                        "Agent 执行超过 {} 分钟",
+                        execution_timeout.as_secs() / 60
+                    ));
+                    break None;
+                }
+            }
         }
+    };
+    let Some(status) = status else {
+        terminate_process_group(pid);
+        let _ = child.kill().await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        finish_process_tracking(workspace, live_logs, active_processes);
+        bail!(forced_error.expect("Agent 强制结束原因"));
     };
     let stdout = stdout_task.await.context("无法汇总 Agent 标准输出")??;
     let stderr = stderr_task.await.context("无法汇总 Agent 错误输出")??;
@@ -741,6 +1189,8 @@ async fn execute_claude_translation_command(
     let stderr_task = tokio::spawn(capture_runtime_stream(
         stderr,
         Some(logs.join("stderr.log")),
+        None,
+        false,
     ));
     let mut stdin = child.stdin.take().context("无法连接 Agent 标准输入")?;
     stdin.write_all(instruction.as_bytes()).await?;
@@ -892,13 +1342,19 @@ fn tail_chars(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
-async fn capture_runtime_stream<R>(mut stream: R, log_path: Option<PathBuf>) -> Result<Vec<u8>>
+async fn capture_runtime_stream<R>(
+    mut stream: R,
+    log_path: Option<PathBuf>,
+    network_failure: Option<Arc<AtomicBool>>,
+    clears_network_failure: bool,
+) -> Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
 {
     let mut output = Vec::new();
     let mut log = log_path.map(fs::File::create).transpose()?;
     let mut buffer = [0u8; 8 * 1024];
+    let mut diagnostic_tail = String::new();
     loop {
         let read = stream.read(&mut buffer).await?;
         if read == 0 {
@@ -909,8 +1365,26 @@ where
             std::io::Write::write_all(log, &buffer[..read])?;
             std::io::Write::flush(log)?;
         }
+        if let Some(network_failure) = &network_failure {
+            if clears_network_failure {
+                network_failure.store(false, Ordering::Relaxed);
+            } else {
+                diagnostic_tail.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if reports_network_failure(&diagnostic_tail) {
+                    network_failure.store(true, Ordering::Relaxed);
+                }
+                diagnostic_tail = tail_chars(&diagnostic_tail, 4_096);
+            }
+        }
     }
     Ok(output)
+}
+
+fn reports_network_failure(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains("tls handshake eof")
+        || value.contains("stream disconnected before completion")
+        || value.contains("error sending request for url")
 }
 
 fn translation_instruction(source_language: &str) -> String {
@@ -1164,11 +1638,13 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        chapter_markdown, execute_claude_translation_command, execute_command,
-        filter_claude_translation_event, parse_claude_translation_stream, truncate,
-        AgentCoordinator,
+        chapter_markdown, custom_runtime_spec, execute_claude_translation_command, execute_command,
+        execute_command_with_limits, filter_claude_translation_event,
+        parse_claude_translation_stream, run_runtime_instruction, terminate_process_group,
+        truncate, AgentCoordinator,
     };
     use crate::db::Database;
+    use crate::models::CustomAgentRuntime;
 
     #[test]
     fn builds_a_book_view_with_stable_block_ids() {
@@ -1188,6 +1664,52 @@ mod tests {
     #[test]
     fn truncates_diagnostic_text_by_character() {
         assert_eq!(truncate("中文错误详情", 4), "中文错误");
+    }
+
+    #[tokio::test]
+    async fn opencode_custom_runtime_uses_noninteractive_json_mode() {
+        let temp = TempDir::new().expect("临时目录");
+        let executable = temp.path().join("opencode");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+if [ "$1" != "run" ] || [ "$2" != "--format" ] || [ "$3" != "json" ]; then
+  sleep 10
+  exit 1
+fi
+printf '%s\n' '{"type":"step_start","sessionID":"session-1","part":{"type":"step-start"}}'
+printf '%s\n' '{"type":"text","sessionID":"session-1","part":{"type":"text","text":"OpenCode 已启动"}}'
+printf '%s\n' '{"type":"step_finish","sessionID":"session-1","part":{"type":"step-finish","reason":"stop"}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let runtime = custom_runtime_spec(CustomAgentRuntime {
+            id: "custom-opencode".to_string(),
+            name: "OpenCode".to_string(),
+            executable: executable.display().to_string(),
+            arguments: Vec::new(),
+        })
+        .expect("识别 OpenCode 运行时");
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_runtime_instruction(
+                &runtime,
+                temp.path(),
+                "只回复：OpenCode 已启动",
+                false,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("OpenCode 不应进入交互式 TUI")
+        .expect("OpenCode 应完成请求");
+
+        assert_eq!(output.answer, "OpenCode 已启动");
     }
 
     #[test]
@@ -1235,6 +1757,144 @@ exit 2
         let detail = format!("{error:#}");
         assert!(detail.contains("translations 字段被截断"), "{detail}");
         assert!(!detail.contains("subtype\":\"init"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn stops_waiting_after_the_agent_reports_persistent_network_failures() {
+        let temp = TempDir::new().expect("临时目录");
+        let executable = temp.path().join("network-failure.sh");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' 'ERROR: Reconnecting... 5/5 (tls handshake eof)' >&2
+sleep 30
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let mut command = tokio::process::Command::new(&executable);
+        command
+            .current_dir(temp.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let started = Instant::now();
+        let error = match execute_command_with_limits(
+            command,
+            temp.path(),
+            "question",
+            true,
+            None,
+            None,
+            Duration::from_secs(5),
+            Duration::from_millis(150),
+        )
+        .await
+        {
+            Ok(_) => panic!("持续网络错误必须停止等待"),
+            Err(error) => error,
+        };
+
+        let detail = format!("{error:#}");
+        assert!(detail.contains("网络连接持续失败"), "{detail}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn keeps_waiting_when_the_agent_recovers_and_starts_answering() {
+        let temp = TempDir::new().expect("临时目录");
+        let executable = temp.path().join("network-recovered.sh");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' 'ERROR: tls handshake eof' >&2
+sleep 0.05
+printf '%s\n' '网络恢复后的回答'
+sleep 0.3
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let mut command = tokio::process::Command::new(&executable);
+        command
+            .current_dir(temp.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let output = execute_command_with_limits(
+            command,
+            temp.path(),
+            "question",
+            true,
+            None,
+            None,
+            Duration::from_secs(5),
+            Duration::from_millis(150),
+        )
+        .await
+        .expect("Agent 恢复输出后应继续等待完成");
+
+        assert_eq!(output.answer, "网络恢复后的回答");
+    }
+
+    #[tokio::test]
+    async fn tracks_and_terminates_a_running_question_process() {
+        let temp = TempDir::new().expect("临时目录");
+        let executable = temp.path().join("long-running-agent.sh");
+        fs::write(&executable, "#!/bin/sh\ncat >/dev/null\nsleep 30\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let workspace = temp.path().join("question-task");
+        fs::create_dir_all(&workspace).unwrap();
+        let active = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let active_for_run = active.clone();
+        let workspace_for_run = workspace.clone();
+        let mut command = tokio::process::Command::new(&executable);
+        command
+            .current_dir(&workspace)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let execution = tokio::spawn(async move {
+            execute_command(
+                command,
+                &workspace_for_run,
+                "question",
+                true,
+                None,
+                Some(&active_for_run),
+            )
+            .await
+        });
+
+        let pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(pid) = active.lock().unwrap().get(&workspace).copied() {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("问答进程应登记为活动进程");
+        terminate_process_group(pid);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), execution)
+            .await
+            .expect("停止后进程应及时退出")
+            .expect("执行任务");
+        assert!(result.is_err());
+        assert!(active.lock().unwrap().is_empty());
     }
 
     #[test]

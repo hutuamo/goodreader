@@ -1,18 +1,28 @@
 {
   "name": "goodreader-local",
   "private": true,
-  "version": "0.2.7",
+  "version": "0.2.10",
   "type": "module",
   "scripts": {
     "frontend:build": "vite build --config vite.config.ts",
     "frontend:dev": "vite --config vite.config.ts",
     "test:import-ui": "node scripts/check-import-progress-ui.mjs",
+    "test:ai-task-status": "node scripts/check-ai-task-status.mjs",
+    "test:ai-markdown": "node scripts/check-ai-markdown.mjs",
+    "test:ai-stop": "node scripts/check-ai-stop.mjs",
+    "test:cover-replacement": "node scripts/check-cover-replacement.mjs",
+    "test:reader-selection-ai": "node scripts/check-reader-selection-ai.mjs",
+    "test:reader-display-settings": "node scripts/check-reader-display-settings.mjs",
     "test:reader-typography": "node scripts/check-reader-typography.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.10.0",
+    "@types/markdown-it": "^14.1.2",
     "typescript": "5.9.3",
     "vite": "7.3.3"
+  },
+  "dependencies": {
+    "markdown-it": "^15.0.0"
   }
 }

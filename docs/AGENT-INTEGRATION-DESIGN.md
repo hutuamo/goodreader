@@ -380,6 +380,47 @@ AgentTasks/<task-id>/
 - 引用用户笔记时必须显示为“你的笔记”，不能伪装成书籍原文。
 - 无法找到书籍依据时，Agent 应明确标记为推断或共享历史观点。
 
+## 当前运行时执行架构
+
+书籍问答采用 Claudian 式持久执行会话：`AgentSessionHost` 是对调用方唯一可见的深模块，按“书籍 ID + 运行时 ID”持有 Provider 原生进程和会话状态。GoodReader 业务层只处理统一、带关联范围的执行事件，不解析 Provider 私有格式；协议、进程复用、异常重建和取消都封装在内部适配器中。
+
+```mermaid
+sequenceDiagram
+    participant UI as AI 侧栏
+    participant API as 本地 HTTP API
+    participant CO as AgentCoordinator
+    participant HOST as AgentSessionHost
+    participant AD as 会话级 Provider 适配器
+    participant CLI as 本机 Agent CLI
+    participant DB as SQLite
+
+    UI->>API: 创建书籍问答
+    API->>CO: 标准任务 + 隔离工作区
+    CO->>DB: 读取共享历史与 Provider 会话
+    CO->>HOST: execute(书籍, 运行时, 请求)
+    HOST->>AD: 复用或创建持久会话
+    AD->>CLI: 原生协议开始新 turn
+    CLI-->>AD: 文本、工具、阶段、完成事件
+    AD-->>HOST: Provider 私有事件
+    HOST-->>CO: 带 session/execution/turn/sequence 的统一事件流
+    CO-->>UI: SSE 推送阶段、文本增量与终态
+    CO->>DB: 保存会话 ID、最终回答与执行状态
+```
+
+| 运行时 | 执行通道 | 会话恢复 | 流式输出 | 停止 |
+| --- | --- | --- | --- | --- |
+| Codex | 持久 `codex app-server --stdio` JSON-RPC | 同一进程复用 thread；重建时 `thread/resume` | `item/agentMessage/delta` | `turn/interrupt` 后回收异常连接，按 thread 恢复 |
+| Claude Code | 持久 `--input-format stream-json --output-format stream-json` | 同一进程连续输入；重建时 `--resume <session-id>` | `content_block_delta` | 回收当前流进程，后续按 session 恢复 |
+| OpenCode | `opencode run --format json` 原生事件流 | 后续 turn 使用 `--session <session-id>` | `text` 事件 | 终止当前进程，后续按 session 恢复 |
+| Cursor Agent | 兼容 CLI 适配器 | 共享上下文包重建 | 完成后输出 | 终止进程组 |
+| 自定义 CLI | 标准输入、标准输出与退出码 | 共享上下文包重建 | 完成后输出 | 终止进程组 |
+
+统一事件包含 turn 开始、阶段变化、会话状态、文本增量、思考增量、工具开始/完成、turn 完成、取消和分类错误。每个事件携带不可变的 `sessionInstanceId`、`executionId`、`turnId` 和单调递增 `sequence`。AI 侧栏通过 SSE 直接消费事件，不再以固定间隔轮询；初始任务快照带最后序号，能够消除重连窗口中的重复增量。
+
+Provider 原生会话按“书籍 ID + 运行时 ID”保存在 `agent_sessions`，运行期间由同键的 `AgentSessionHost` 会话复用一个 CLI 进程。它只负责同一 Provider 的高效续接；`ai_messages` 和稳定会话工作区中的 `context/history.jsonl` 仍是跨 Provider 共享历史的权威来源。清除 AI 工作区或永久忘记书籍时，先释放对应进程，再删除原生会话记录。
+
+导入、翻译等需要 JSON Schema 的批处理暂时保留专用结构化执行路径，因为它们的成功条件是确定性的完整 JSON，而不是对话增量。两条路径共享运行时发现、进程隔离和日志目录，但不强行合并不同的输出语义。
+
 ## 持久化模型
 
 建议在现有 SQLite 中增加以下逻辑实体：
@@ -390,6 +431,7 @@ AgentTasks/<task-id>/
 | `book_ai_workspaces` | 以书籍 UUID 为唯一外键，维护共享历史版本和索引状态 |
 | `agent_tasks` | 目标、类型、状态、能力策略、当前步骤、当前运行时 |
 | `agent_executions` | 一次 CLI 调用、运行时、原生会话 ID、开始结束时间、结果和错误 |
+| `agent_sessions` | 每本书、每个运行时的原生会话 ID 与少量 Provider 状态 |
 | `task_checkpoints` | 可恢复步骤、上下文版本和选定产物版本 |
 | `ai_messages` | 用户与 Agent 的追加式协作消息及来源运行时 |
 | `agent_artifacts` | 逻辑产物身份、类型、当前接受版本 |

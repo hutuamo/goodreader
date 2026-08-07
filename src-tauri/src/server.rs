@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,6 +14,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -21,9 +23,11 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
 
-use crate::agent::AgentCoordinator;
+use crate::agent::{AgentCoordinator, AgentTaskStreamEvent};
 use crate::db::Database;
 use crate::generation::ImportManager;
 use crate::importer::import_html_directory;
@@ -33,8 +37,8 @@ use crate::models::{
     Bootstrap, ChapterSummary, CreateAnnotation, CreateCustomAgentRuntime, CreateQuestion,
     ImportBookResponse, ImportPreflight, ImportPreflightRequest, ImportSourceKind, ImportTaskEvent,
     ImportTaskSummary, ImportedBookSummary, MoveImportTaskRequest, ParallelText,
-    ResumeImportRequest, SaveProgress, SaveSetting, StartImportRequest, SwitchAgentRuntime,
-    UpdateAnnotation,
+    ReplaceCoverResponse, ResumeImportRequest, SaveProgress, SaveSetting, StartImportRequest,
+    SwitchAgentRuntime, UpdateAnnotation,
 };
 
 const APP_INDEX: &str = include_str!("../../frontend/dist/index.html");
@@ -42,10 +46,12 @@ const APP_JS: &[u8] = include_bytes!("../../frontend/dist/assets/app.js");
 const APP_CSS: &[u8] = include_bytes!("../../frontend/dist/assets/app.css");
 const READER_JS: &[u8] = include_bytes!("../../frontend/dist/assets/reader.js");
 const READER_CSS: &[u8] = include_bytes!("../../frontend/dist/assets/reader.css");
+const MAX_COVER_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
     books_dir: std::path::PathBuf,
+    cover_overrides_dir: std::path::PathBuf,
     catalog: Arc<RwLock<crate::models::Catalog>>,
     database: Arc<Database>,
     agent: Arc<AgentCoordinator>,
@@ -118,6 +124,10 @@ pub async fn start(
         .parent()
         .unwrap_or(&agent_tasks_dir)
         .join("ImportTasks");
+    let cover_overrides_dir = agent_tasks_dir
+        .parent()
+        .unwrap_or(&agent_tasks_dir)
+        .join("CoverOverrides");
     let agent = Arc::new(AgentCoordinator::new(agent_tasks_dir, database.clone())?);
     let imports = Arc::new(ImportManager::new(
         import_tasks_dir,
@@ -127,6 +137,7 @@ pub async fn start(
     let state = AppState {
         catalog: Arc::new(RwLock::new(scan_books(&books_dir))),
         books_dir,
+        cover_overrides_dir,
         database,
         agent,
         imports,
@@ -174,8 +185,17 @@ pub async fn start(
             delete(delete_custom_agent_runtime),
         )
         .route("/api/agent/tasks/:task_id", get(get_agent_task))
+        .route(
+            "/api/agent/tasks/:task_id/events",
+            get(stream_agent_task_events),
+        )
         .route("/api/agent/tasks/:task_id/retry", post(retry_agent_task))
+        .route("/api/agent/tasks/:task_id/stop", post(stop_agent_task))
         .route("/api/books/:book_id", get(book_detail))
+        .route(
+            "/api/books/:book_id/cover",
+            get(book_cover).post(replace_book_cover),
+        )
         .route(
             "/api/books/:book_id/ai",
             get(book_ai_workspace).delete(clear_book_ai_workspace),
@@ -384,6 +404,7 @@ async fn import_preflight(
     Json(input): Json<ImportPreflightRequest>,
 ) -> Result<Json<ImportPreflight>, ApiError> {
     let imports = state.imports.clone();
+    let pdf_mode = input.pdf_mode;
     let result = match input.kind {
         ImportSourceKind::Url => {
             let url = input
@@ -404,9 +425,11 @@ async fn import_preflight(
             let Some(source) = source else {
                 return Err(ApiError::bad_request("已取消选择来源"));
             };
-            tokio::task::spawn_blocking(move || imports.preflight_local(kind, &source))
-                .await
-                .map_err(ApiError::internal)?
+            tokio::task::spawn_blocking(move || {
+                imports.preflight_local_with_pdf_mode(kind, &source, pdf_mode)
+            })
+            .await
+            .map_err(ApiError::internal)?
         }
     };
     Ok(Json(result.map_err(ApiError::bad_request)?))
@@ -521,7 +544,57 @@ async fn book_detail(
         .database
         .progress(&book_id)
         .map_err(ApiError::internal)?;
-    Ok(Json(book_summary(&package, progress)))
+    Ok(Json(book_summary(
+        &package,
+        progress,
+        &state.cover_overrides_dir,
+    )))
+}
+
+async fn book_cover(
+    State(state): State<AppState>,
+    AxumPath(book_id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let package = book_package(&state, &book_id)?;
+    let path = cover_override_path(&state.cover_overrides_dir, &book_id)
+        .unwrap_or_else(|| package.root.join(&package.manifest.cover));
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let bytes = fs::read(&path).map_err(ApiError::internal)?;
+    Ok(asset_response(
+        &bytes,
+        content_type_for(&extension),
+        app_csp(),
+    ))
+}
+
+async fn replace_book_cover(
+    State(state): State<AppState>,
+    AxumPath(book_id): AxumPath<String>,
+) -> Result<Json<ReplaceCoverResponse>, ApiError> {
+    book_package(&state, &book_id)?;
+    let selected = tokio::task::spawn_blocking(choose_cover_image)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::bad_request)?;
+    let changed = if let Some(source) = selected {
+        let overrides = state.cover_overrides_dir.clone();
+        let id = book_id.clone();
+        tokio::task::spawn_blocking(move || save_cover_override(&overrides, &id, &source))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(ApiError::bad_request)?;
+        true
+    } else {
+        false
+    };
+    Ok(Json(ReplaceCoverResponse {
+        changed,
+        bootstrap: build_bootstrap(&state).map_err(ApiError::internal)?,
+    }))
 }
 
 async fn list_agent_runtimes(
@@ -574,10 +647,12 @@ async fn book_ai_workspace(
             .database
             .ai_messages(&book_id)
             .map_err(ApiError::internal)?,
-        active_tasks: state
-            .database
-            .active_agent_tasks(&book_id)
-            .map_err(ApiError::internal)?,
+        active_tasks: state.agent.decorate_tasks(
+            state
+                .database
+                .active_agent_tasks(&book_id)
+                .map_err(ApiError::internal)?,
+        ),
     }))
 }
 
@@ -600,6 +675,16 @@ async fn create_book_question(
                 .unwrap_or("所选 Agent 运行时当前不可用"),
         ));
     }
+    if !state
+        .database
+        .active_agent_tasks(&book_id)
+        .map_err(ApiError::internal)?
+        .is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "这本书已有正在运行的 AI 请求，请先等待完成或停止当前请求",
+        ));
+    }
 
     let task = state
         .database
@@ -612,7 +697,7 @@ async fn create_book_question(
     state
         .agent
         .start_question(package, annotations, task.clone());
-    Ok((StatusCode::ACCEPTED, Json(task)))
+    Ok((StatusCode::ACCEPTED, Json(state.agent.decorate_task(task))))
 }
 
 async fn get_agent_task(
@@ -623,8 +708,39 @@ async fn get_agent_task(
         .database
         .agent_task(&task_id)
         .map_err(ApiError::internal)?
-        .map(Json)
+        .map(|task| Json(state.agent.decorate_task(task)))
         .ok_or_else(|| ApiError::not_found("Agent 任务不存在"))
+}
+
+async fn stream_agent_task_events(
+    State(state): State<AppState>,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let task_updates = state.agent.subscribe_task_updates();
+    let current = state
+        .database
+        .agent_task(&task_id)
+        .map_err(ApiError::internal)?
+        .map(|task| state.agent.decorate_task(task))
+        .ok_or_else(|| ApiError::not_found("Agent 任务不存在"))?;
+    let requested_task_id = task_id.clone();
+    let updates = BroadcastStream::new(task_updates).filter_map(move |result| match result {
+        Ok(event) if event.task_id() == requested_task_id => Some(event),
+        _ => None,
+    });
+    let stream = tokio_stream::once(AgentTaskStreamEvent::Snapshot { task: current })
+        .chain(updates)
+        .map(|event| {
+            let data = serde_json::to_string(&event).unwrap_or_else(|_| {
+                r#"{"status":"paused","error":"任务状态序列化失败"}"#.to_string()
+            });
+            Ok(Event::default().data(data))
+        });
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 async fn retry_agent_task(
@@ -663,7 +779,18 @@ async fn retry_agent_task(
     state
         .agent
         .start_question(package, annotations, task.clone());
-    Ok((StatusCode::ACCEPTED, Json(task)))
+    Ok((StatusCode::ACCEPTED, Json(state.agent.decorate_task(task))))
+}
+
+async fn stop_agent_task(
+    State(state): State<AppState>,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<AgentTask>, ApiError> {
+    state
+        .agent
+        .stop_question(&task_id)
+        .map(Json)
+        .map_err(ApiError::bad_request)
 }
 
 async fn clear_book_ai_workspace(
@@ -671,6 +798,7 @@ async fn clear_book_ai_workspace(
     AxumPath(book_id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
     book_package(&state, &book_id)?;
+    state.agent.dispose_book_sessions(&book_id).await;
     state
         .database
         .clear_ai_workspace(&book_id)
@@ -807,10 +935,12 @@ async fn forget_book(
     State(state): State<AppState>,
     AxumPath(book_id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
+    state.agent.dispose_book_sessions(&book_id).await;
     state
         .database
         .forget_book(&book_id)
         .map_err(ApiError::internal)?;
+    remove_cover_override(&state.cover_overrides_dir, &book_id).map_err(ApiError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1080,7 +1210,13 @@ fn build_bootstrap(state: &AppState) -> Result<Bootstrap> {
     let books = catalog
         .books
         .values()
-        .map(|package| book_summary(package, progress.get(&package.manifest.id).cloned()))
+        .map(|package| {
+            book_summary(
+                package,
+                progress.get(&package.manifest.id).cloned(),
+                &state.cover_overrides_dir,
+            )
+        })
         .collect();
     Ok(Bootstrap {
         books,
@@ -1089,15 +1225,25 @@ fn build_bootstrap(state: &AppState) -> Result<Bootstrap> {
     })
 }
 
-fn book_summary(package: &BookPackage, progress: Option<crate::models::Progress>) -> BookSummary {
+fn book_summary(
+    package: &BookPackage,
+    progress: Option<crate::models::Progress>,
+    cover_overrides_dir: &Path,
+) -> BookSummary {
     let id = &package.manifest.id;
+    let cover_version = cover_override_path(cover_overrides_dir, id)
+        .and_then(|path| fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
     BookSummary {
         id: id.clone(),
         title: package.manifest.title.clone(),
         original_title: package.manifest.original_title.clone(),
         author: package.manifest.author.clone(),
         language: package.manifest.language.clone(),
-        cover_url: format!("/books/{id}/{}", package.manifest.cover),
+        cover_url: format!("/api/books/{id}/cover?v={cover_version}"),
         entry_url: format!("/books/{id}/{}", package.manifest.entry),
         chapters: package
             .manifest
@@ -1112,6 +1258,92 @@ fn book_summary(package: &BookPackage, progress: Option<crate::models::Progress>
             .collect(),
         progress,
     }
+}
+
+#[derive(Clone, Copy)]
+struct CoverImageFormat {
+    extension: &'static str,
+}
+
+fn cover_image_format(bytes: &[u8]) -> Option<CoverImageFormat> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(CoverImageFormat { extension: "png" })
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some(CoverImageFormat { extension: "jpg" })
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(CoverImageFormat { extension: "gif" })
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some(CoverImageFormat { extension: "webp" })
+    } else {
+        None
+    }
+}
+
+fn cover_override_path(root: &Path, book_id: &str) -> Option<PathBuf> {
+    ["png", "jpg", "gif", "webp"]
+        .into_iter()
+        .map(|extension| root.join(format!("{book_id}.{extension}")))
+        .find(|path| path.is_file())
+}
+
+fn save_cover_override(root: &Path, book_id: &str, source: &Path) -> Result<()> {
+    let metadata = fs::metadata(source).context("无法读取封面图片")?;
+    if !metadata.is_file() {
+        bail!("选择的封面不是普通图片文件");
+    }
+    if metadata.len() > MAX_COVER_BYTES {
+        bail!("封面图片不能超过 32 MB");
+    }
+    let bytes = fs::read(source).context("无法读取封面图片")?;
+    let format =
+        cover_image_format(&bytes).context("仅支持 PNG、JPEG、GIF 或 WebP 格式的封面图片")?;
+    fs::create_dir_all(root).context("无法创建封面覆盖目录")?;
+    let temporary = root.join(format!("{book_id}.tmp"));
+    fs::write(&temporary, bytes).context("无法暂存新封面")?;
+    remove_cover_override(root, book_id)?;
+    fs::rename(
+        temporary,
+        root.join(format!("{book_id}.{}", format.extension)),
+    )
+    .context("无法保存新封面")?;
+    Ok(())
+}
+
+fn remove_cover_override(root: &Path, book_id: &str) -> Result<()> {
+    for extension in ["png", "jpg", "gif", "webp"] {
+        let path = root.join(format!("{book_id}.{extension}"));
+        if path.exists() {
+            fs::remove_file(path).context("无法删除封面覆盖图片")?;
+        }
+    }
+    Ok(())
+}
+
+fn choose_cover_image() -> Result<Option<PathBuf>> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("GOODREADER_COVER_IMAGE") {
+        return Ok(Some(PathBuf::from(path)));
+    }
+
+    let output = Command::new("osascript")
+        .args([
+            "-e",
+            r#"POSIX path of (choose file with prompt "选择新的书籍封面" of type {"public.image"})"#,
+        ])
+        .output()
+        .context("无法打开 macOS 图片选择器")?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        if error.contains("(-128)") || error.contains("User canceled") {
+            return Ok(None);
+        }
+        bail!("图片选择器失败：{}", error.trim());
+    }
+    let path = String::from_utf8(output.stdout)
+        .context("图片选择器返回了无效路径")?
+        .trim()
+        .to_string();
+    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
 }
 
 fn book_package(state: &AppState, book_id: &str) -> Result<BookPackage, ApiError> {
@@ -1227,7 +1459,14 @@ fn secure_eq(left: &str, right: &str) -> bool {
 fn validate_setting_key(key: &str) -> Result<(), ApiError> {
     if matches!(
         key,
-        "highlight-color" | "annotation-filter" | "reader-theme" | "ai-send-key" | "topbar-pinned"
+        "highlight-color"
+            | "annotation-filter"
+            | "reader-theme"
+            | "ai-send-key"
+            | "topbar-pinned"
+            | "reader-font-size"
+            | "sidebar-width"
+            | "ai-sidebar-width"
     ) {
         Ok(())
     } else {
@@ -1243,7 +1482,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        book_csp, book_summary, deletion_target, inject_reader, secure_eq, validate_setting_key,
+        book_csp, book_summary, cover_image_format, cover_override_path, deletion_target,
+        inject_reader, save_cover_override, secure_eq, validate_setting_key,
     };
     use crate::models::{BookManifest, BookPackage, ChapterManifest};
 
@@ -1288,10 +1528,13 @@ mod tests {
     }
 
     #[test]
-    fn reader_theme_is_an_allowed_setting() {
+    fn reader_preferences_are_allowed_settings() {
         assert!(validate_setting_key("reader-theme").is_ok());
         assert!(validate_setting_key("ai-send-key").is_ok());
         assert!(validate_setting_key("topbar-pinned").is_ok());
+        assert!(validate_setting_key("reader-font-size").is_ok());
+        assert!(validate_setting_key("sidebar-width").is_ok());
+        assert!(validate_setting_key("ai-sidebar-width").is_ok());
         assert!(validate_setting_key("unknown-theme").is_err());
     }
 
@@ -1319,8 +1562,31 @@ mod tests {
             },
         };
 
-        let summary = book_summary(&package, None);
+        let covers = tempdir().unwrap();
+        let summary = book_summary(&package, None, covers.path());
         assert_eq!(summary.language.as_deref(), Some("zh-CN"));
         assert!(summary.chapters[0].has_parallel_text);
+    }
+
+    #[test]
+    fn saves_a_valid_cover_without_modifying_the_book_package() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("selected-image");
+        fs::write(&source, b"\x89PNG\r\n\x1a\ncover-data").unwrap();
+        let overrides = root.path().join("CoverOverrides");
+
+        save_cover_override(&overrides, "book-id", &source).unwrap();
+
+        let saved = cover_override_path(&overrides, "book-id").expect("应保存覆盖封面");
+        assert_eq!(
+            saved.extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
+        assert_eq!(fs::read(saved).unwrap(), fs::read(source).unwrap());
+    }
+
+    #[test]
+    fn rejects_executable_vector_images_as_covers() {
+        assert!(cover_image_format(b"<svg><script>alert(1)</script></svg>").is_none());
     }
 }

@@ -1,9 +1,11 @@
 mod agent;
+mod agent_session;
 mod db;
 mod generation;
 mod importer;
 mod library;
 mod models;
+mod pdf_composer;
 mod server;
 
 use std::sync::{mpsc, Arc, Mutex};

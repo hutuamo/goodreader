@@ -52,7 +52,13 @@ type ImportBookResponse = {
   bootstrap: Bootstrap;
 };
 
+type ReplaceCoverResponse = {
+  changed: boolean;
+  bootstrap: Bootstrap;
+};
+
 type ImportSourceKind = "html" | "pdf" | "url";
+type PdfImportMode = "auto" | "text-layer" | "ocr";
 
 type ImportChapterCandidate = {
   id: string;
@@ -75,6 +81,9 @@ type ImportPreflight = {
   imageCount: number;
   characterCount: number;
   requiresOcrPages: number[];
+  uncertainPages: number[];
+  pdfMode: PdfImportMode | null;
+  pdfType: "digital" | "scanned" | "mixed" | null;
   dynamicRendering: boolean;
   warnings: string[];
 };
@@ -212,6 +221,7 @@ function icon(name: string): string {
     queue: '<path d="M5 6h14M5 12h14M5 18h14"/><circle cx="3" cy="6" r=".7" fill="currentColor" stroke="none"/><circle cx="3" cy="12" r=".7" fill="currentColor" stroke="none"/><circle cx="3" cy="18" r=".7" fill="currentColor" stroke="none"/>',
     link: '<path d="M10 13a5 5 0 0 0 7.1.1l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"/><path d="M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1"/>',
     file: '<path d="M6 2h8l4 4v16H6V2Z"/><path d="M14 2v5h5"/><path d="M9 13h6M9 17h6"/>',
+    image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m4 18 5-5 3 3 3-4 5 6"/>',
     pause: '<path d="M8 5v14M16 5v14"/>',
     play: '<path d="m8 5 11 7-11 7V5Z"/>',
     chevron: '<path d="m6 9 6 6 6-6"/>',
@@ -651,7 +661,7 @@ async function importBook(button: HTMLButtonElement): Promise<void> {
     </div>
     <div class="import-source-grid">
       <button class="import-source-card" data-import-source="pdf">
-        <span>${icon("file")}</span><strong>PDF 文件</strong><small>支持带文本层的数字 PDF；扫描页会在预检中提示 OCR</small>
+        <span>${icon("file")}</span><strong>PDF 文件</strong><small>每页由 Agent 恢复阅读顺序、书籍排版和完整图片；扫描页会在预检中提示 OCR</small>
       </button>
       <button class="import-source-card" data-import-source="html">
         <span>${icon("folder")}</span><strong>本地 HTML 目录</strong><small>复制来源快照，移除原有脚本并接入统一阅读器</small>
@@ -660,6 +670,22 @@ async function importBook(button: HTMLButtonElement): Promise<void> {
         <span>${icon("link")}</span><strong>在线链接</strong><small>发现同源章节，下载资源并生成可离线阅读的静态书籍</small>
       </button>
     </div>
+    <form class="url-import-form" id="pdfImportForm" hidden>
+      <div class="settings-section-heading"><h3>选择 PDF 文本来源</h3><span>可在自动判断不准确时覆盖</span></div>
+      <label class="option-row">
+        <input type="radio" name="pdfMode" value="auto" checked />
+        <span><strong>自动识别</strong><small>逐页检查文本层，发现扫描正文时暂停并报告页码</small></span>
+      </label>
+      <label class="option-row">
+        <input type="radio" name="pdfMode" value="text-layer" />
+        <span><strong>使用 PDF 文本层</strong><small>适用于数字 PDF 或已经完成 OCR、具有可用文本层的文件</small></span>
+      </label>
+      <label class="option-row">
+        <input type="radio" name="pdfMode" value="ocr" />
+        <span><strong>扫描 PDF，需要 OCR</strong><small>当前版本尚未配置本地 OCR，预检后会暂停生成</small></span>
+      </label>
+      <div class="modal-actions"><button class="secondary-button" type="button" id="cancelPdfImport">返回</button><button class="primary-button" type="submit">选择 PDF</button></div>
+    </form>
     <form class="url-import-form" id="urlImportForm" hidden>
       <label><span>公开链接</span><input id="importUrl" type="url" required placeholder="https://example.com/book/" autocomplete="url" /></label>
       <div class="modal-actions"><button class="secondary-button" type="button" id="cancelUrlImport">返回</button><button class="primary-button" type="submit">分析链接</button></div>
@@ -675,6 +701,12 @@ async function importBook(button: HTMLButtonElement): Promise<void> {
         document.querySelector<HTMLInputElement>("#importUrl")?.focus();
         return;
       }
+      if (kind === "pdf") {
+        document.querySelector<HTMLElement>(".import-source-grid")!.hidden = true;
+        document.querySelector<HTMLFormElement>("#pdfImportForm")!.hidden = false;
+        document.querySelector<HTMLInputElement>('input[name="pdfMode"]')?.focus();
+        return;
+      }
       void runWithButton(sourceButton, async () => {
         const preflight = await api<ImportPreflight>("/api/import/preflight", {
           method: "POST",
@@ -687,6 +719,24 @@ async function importBook(button: HTMLButtonElement): Promise<void> {
   document.querySelector("#cancelUrlImport")?.addEventListener("click", () => {
     document.querySelector<HTMLElement>(".import-source-grid")!.hidden = false;
     document.querySelector<HTMLFormElement>("#urlImportForm")!.hidden = true;
+  });
+  document.querySelector("#cancelPdfImport")?.addEventListener("click", () => {
+    document.querySelector<HTMLElement>(".import-source-grid")!.hidden = false;
+    document.querySelector<HTMLFormElement>("#pdfImportForm")!.hidden = true;
+  });
+  document.querySelector<HTMLFormElement>("#pdfImportForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    const submit = form.querySelector<HTMLButtonElement>('button[type="submit"]');
+    const pdfMode = form.querySelector<HTMLInputElement>('input[name="pdfMode"]:checked')?.value as PdfImportMode | undefined;
+    if (!submit || !pdfMode) return;
+    void runWithButton(submit, async () => {
+      const preflight = await api<ImportPreflight>("/api/import/preflight", {
+        method: "POST",
+        body: JSON.stringify({ kind: "pdf", pdfMode }),
+      });
+      await showImportConfiguration(preflight);
+    });
   });
   document.querySelector<HTMLFormElement>("#urlImportForm")?.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -705,7 +755,8 @@ async function importBook(button: HTMLButtonElement): Promise<void> {
 }
 
 async function showImportConfiguration(preflight: ImportPreflight): Promise<void> {
-  const runtimes = preflight.language === "zh-CN"
+  const needsLayoutAgent = preflight.kind === "pdf";
+  const runtimes = preflight.language === "zh-CN" && !needsLayoutAgent
     ? []
     : await api<AgentRuntime[]>("/api/agent/runtimes");
   const availableRuntimes = runtimes.filter((runtime) => runtime.available);
@@ -716,6 +767,9 @@ async function showImportConfiguration(preflight: ImportPreflight): Promise<void
       ? "非中文为主"
       : "混合或无法确定";
   const ocrBlocked = preflight.requiresOcrPages.length > 0;
+  const pdfTypeLabel = preflight.pdfType
+    ? { digital: "数字 PDF", scanned: "扫描 PDF", mixed: "混合 PDF" }[preflight.pdfType]
+    : null;
   showModal(`
     <div class="modal-header">
       <div>
@@ -728,10 +782,12 @@ async function showImportConfiguration(preflight: ImportPreflight): Promise<void
       <section class="preflight-summary">
         <div><span>来源</span><strong>${escapeHtml(preflight.sourceName)}</strong></div>
         <div><span>语言判断</span><strong>${languageLabel}</strong></div>
+        ${pdfTypeLabel ? `<div><span>PDF 类型</span><strong>${pdfTypeLabel}</strong></div>` : ""}
         <div><span>规模</span><strong>${preflight.pageCount ? `${preflight.pageCount} 页 · ` : ""}${preflight.characterCount.toLocaleString("zh-CN")} 字符</strong></div>
         <div><span>图片</span><strong>${preflight.imageCount} 项</strong></div>
       </section>
       ${ocrBlocked ? `<div class="import-blocker">${icon("warning")}<div><strong>需要本地 OCR，当前不能开始生成</strong><p>正文扫描页：${formatPageList(preflight.requiresOcrPages)}。任务停留在预检阶段，不会生成残缺书籍。</p></div></div>` : ""}
+      ${needsLayoutAgent && !availableRuntimes.length ? `<div class="import-blocker">${icon("warning")}<div><strong>需要可用 Agent，当前不能开始生成</strong><p>PDF 的每一页都需要由 Agent 恢复阅读顺序、语义块和完整图片区域。请先在设置中配置 Agent。</p></div></div>` : ""}
       ${preflight.warnings.map((warning) => `<div class="import-warning">${icon("warning")}<span>${escapeHtml(warning)}</span></div>`).join("")}
       <div class="import-fields">
         <label><span>书名</span><input id="importTitle" required maxlength="240" value="${escapeHtml(preflight.title)}" /></label>
@@ -758,12 +814,12 @@ async function showImportConfiguration(preflight: ImportPreflight): Promise<void
           <input id="preserveOriginal" type="checkbox" disabled />
           <span><strong>支持显示原文</strong><small>保存正文块级原文并建立对齐，需要更长生成时间</small></span>
         </label>
-        <label class="agent-select-row" id="importAgentRow" hidden><span>执行 Agent</span><select id="importRuntime">${availableRuntimes.map((runtime) => `<option value="${escapeHtml(runtime.id)}">${escapeHtml(runtime.name)} · ${escapeHtml(runtime.version ?? "可用")}</option>`).join("")}</select></label>
+        <label class="agent-select-row" id="importAgentRow" ${needsLayoutAgent ? "" : "hidden"}><span>${needsLayoutAgent ? "PDF 排版 Agent" : "执行 Agent"}</span><select id="importRuntime">${availableRuntimes.map((runtime) => `<option value="${escapeHtml(runtime.id)}">${escapeHtml(runtime.name)} · ${escapeHtml(runtime.version ?? "可用")}</option>`).join("")}</select></label>
       </section>
-      <div class="import-workload"><strong>工作量提示</strong><p id="workloadText">仅执行确定性转换与安全校验。</p></div>
+      <div class="import-workload"><strong>工作量提示</strong><p id="workloadText">${needsLayoutAgent ? "逐页调用 Agent 恢复阅读顺序、书籍排版和完整图片区域；每页完成后保存检查点。" : "仅执行确定性转换与安全校验。"}</p></div>
       <div class="modal-actions">
         <button class="secondary-button" type="button" data-close>取消</button>
-        <button class="primary-button" id="startImportTask" type="submit" ${ocrBlocked ? "disabled" : ""}>开始生成</button>
+        <button class="primary-button" id="startImportTask" type="submit" ${ocrBlocked || (needsLayoutAgent && !availableRuntimes.length) ? "disabled" : ""}>开始生成</button>
       </div>
     </form>
   `, "wide import-wizard");
@@ -778,13 +834,15 @@ async function showImportConfiguration(preflight: ImportPreflight): Promise<void
       preserve.disabled = !enabled;
       if (!enabled) preserve.checked = false;
     }
-    if (agentRow) agentRow.hidden = !enabled;
+    if (agentRow) agentRow.hidden = !needsLayoutAgent && !enabled;
     if (workload) {
       workload.textContent = !enabled
-        ? "仅执行确定性转换与安全校验。"
+        ? needsLayoutAgent
+          ? "逐页调用 Agent 恢复阅读顺序、书籍排版和完整图片区域；每页完成后保存检查点。"
+          : "仅执行确定性转换与安全校验。"
         : preserve?.checked
-          ? "转换、翻译并建立正文块级原文对齐，属于耗时最长的生成方式。"
-          : "转换并翻译为简体中文，耗时取决于正文块数量和 Agent 速度。";
+          ? `${needsLayoutAgent ? "逐页 Agent 排版后，" : ""}翻译并建立正文块级原文对齐，属于耗时最长的生成方式。`
+          : `${needsLayoutAgent ? "逐页 Agent 排版后，" : ""}翻译为简体中文，耗时取决于正文块数量和 Agent 速度。`;
     }
   };
   translate?.addEventListener("change", updateTranslationOptions);
@@ -808,7 +866,7 @@ async function showImportConfiguration(preflight: ImportPreflight): Promise<void
           chapters,
           translate: translate?.checked ?? false,
           preserveOriginal: preserve?.checked ?? false,
-          runtimeId: translate?.checked ? document.querySelector<HTMLSelectElement>("#importRuntime")?.value : null,
+          runtimeId: needsLayoutAgent || translate?.checked ? document.querySelector<HTMLSelectElement>("#importRuntime")?.value : null,
         }),
       });
       showImportTaskProgress(task);
@@ -817,7 +875,7 @@ async function showImportConfiguration(preflight: ImportPreflight): Promise<void
 }
 
 function sourceKindLabel(kind: ImportSourceKind): string {
-  return { html: "本地 HTML", pdf: "数字 PDF", url: "在线链接" }[kind];
+  return { html: "本地 HTML", pdf: "PDF", url: "在线链接" }[kind];
 }
 
 function formatPageList(pages: number[]): string {
@@ -1276,6 +1334,7 @@ function showBookMenu(book: Book, anchor: HTMLButtonElement): void {
   menu.setAttribute("role", "menu");
   menu.innerHTML = `
     <button role="menuitem" data-menu="home">${icon("book")}<span>打开书籍首页</span></button>
+    <button role="menuitem" data-menu="cover">${icon("image")}<span>替换封面</span></button>
     <div class="menu-separator"></div>
     <button role="menuitem" data-menu="delete" class="danger-item">${icon("trash")}<span>删除书籍副本</span></button>
     <button role="menuitem" data-menu="forget" class="danger-item">${icon("warning")}<span>永久忘记全部数据</span></button>
@@ -1293,6 +1352,10 @@ function showBookMenu(book: Book, anchor: HTMLButtonElement): void {
   menu.querySelector<HTMLButtonElement>('[data-menu="home"]')?.addEventListener("click", () => {
     close();
     window.location.href = book.entryUrl;
+  });
+  menu.querySelector<HTMLButtonElement>('[data-menu="cover"]')?.addEventListener("click", () => {
+    close();
+    void replaceBookCover(book);
   });
   menu.querySelector<HTMLButtonElement>('[data-menu="delete"]')?.addEventListener("click", () => {
     close();
@@ -1317,6 +1380,18 @@ function showBookMenu(book: Book, anchor: HTMLButtonElement): void {
       { once: true },
     );
     menu.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+  });
+}
+
+async function replaceBookCover(book: Book): Promise<void> {
+  await run(async () => {
+    const response = await api<ReplaceCoverResponse>(
+      `/api/books/${encodeURIComponent(book.id)}/cover`, { method: "POST", body: "{}" },
+    );
+    if (!response.changed) return;
+    data = response.bootstrap;
+    render();
+    toast("书籍封面已替换");
   });
 }
 

@@ -8,7 +8,7 @@ GoodReader 是一个面向 macOS 的本地书架与统一阅读器。它把 PDF�
 
 项目的核心原则是：书籍正文保持不可变，所有阅读状态由 GoodReader 外置管理；书籍制作在本机完成，AI 能力复用用户已经配置好的 Codex、Claude Code、Cursor 或自定义 CLI，不在 GoodReader 中保存模型 API Key。
 
-> 当前版本：`0.2.7`。项目仍处于早期阶段，当前发行目标是 macOS 13+、Apple Silicon。
+> 当前版本：`0.2.10`。项目仍处于早期阶段，当前发行目标是 macOS 13+、Apple Silicon。
 
 ## 功能概览
 
@@ -18,6 +18,7 @@ GoodReader 是一个面向 macOS 的本地书架与统一阅读器。它把 PDF�
 - 统一阅读体验：目录、前后章、阅读进度、明暗主题和沉浸式顶部栏。
 - 阅读标注：支持高亮、笔记和以选中文字为锚点的书签。
 - 书籍 AI：在阅读区侧栏中进行摘要、问答和书籍制作协作。
+- 原生 Agent 会话：Codex app-server、Claude stream-json 与 OpenCode JSON 会话按书籍续接，回答通过 SSE 实时推送；认证仍由各 CLI 自己管理。
 - 持久化生成任务：支持后台运行、暂停、恢复、失败重试和详细进度事件。
 - 本地优先：书籍、阅读状态、任务历史和 AI 工作区均保存在本机。
 
@@ -81,6 +82,12 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer npm run tauri -- build
 
 ```bash
 npm run test:import-ui
+npm run test:ai-task-status
+npm run test:ai-markdown
+npm run test:ai-stop
+npm run test:cover-replacement
+npm run test:reader-selection-ai
+npm run test:reader-display-settings
 npm run test:reader-typography
 cargo fmt --check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
