@@ -271,7 +271,10 @@ impl ImportManager {
     pub fn events_since(&self, id: &str, after_seq: u64) -> Result<Vec<ImportTaskEvent>> {
         let task = self.load_task(id)?;
         let mut events = self.load_events(id)?;
-        if task.summary.status == "running" && task.summary.stage == "translating" {
+        // 翻译与 PDF 逐页排版都在 Agent 工作区写实时日志，两个阶段都需要附加实时输出
+        if task.summary.status == "running"
+            && matches!(task.summary.stage.as_str(), "translating" | "converting")
+        {
             if let Some(event) = self.live_agent_output(id)? {
                 events.push(event);
             }
@@ -752,7 +755,9 @@ impl ImportManager {
         fs::create_dir_all(&page_workspace_root)?;
         let composer = PdfPageComposer::new(self.agent.clone());
         let repeated_lines = repeated_pdf_lines(&pages);
-        let image_pages = pdf_image_pages(&pdf).unwrap_or_default();
+        let pdf_for_scan = pdf.clone();
+        let image_pages =
+            tokio::task::spawn_blocking(move || pdf_image_pages(&pdf_for_scan)).await??;
         let total_pages = selected_pages.len();
         let mut page_html = BTreeMap::new();
         let mut image_count = 0usize;
@@ -763,7 +768,12 @@ impl ImportManager {
             let input_image = workspace.join("rendered-page.png");
             if !input_image.is_file() {
                 fs::create_dir_all(&workspace)?;
-                render_pdf_page(&pdf, page, &input_image, 144)?;
+                let pdf_for_render = pdf.clone();
+                let render_target = input_image.clone();
+                tokio::task::spawn_blocking(move || {
+                    render_pdf_page(&pdf_for_render, page, &render_target, 144)
+                })
+                .await??;
             }
             let (image_width, image_height) = png_dimensions(&input_image)?;
             let lines = pdf_source_lines(&pages[page - 1], &repeated_lines);
@@ -812,7 +822,13 @@ impl ImportManager {
             for (figure_index, figure) in composed.figures.iter().enumerate() {
                 let file_name = format!("page-{page:04}-figure-{:02}.png", figure_index + 1);
                 let figure_path = destination.join("assets/figures").join(&file_name);
-                render_pdf_region(&pdf, page, &figure.crop, &figure_path, 144)?;
+                let pdf_for_crop = pdf.clone();
+                let crop = figure.crop.clone();
+                let crop_target = figure_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    render_pdf_region(&pdf_for_crop, page, &crop, &crop_target, 144)
+                })
+                .await??;
                 let caption = if figure.caption.trim().is_empty() {
                     String::new()
                 } else {
@@ -851,7 +867,12 @@ impl ImportManager {
                 html_document(&chapter.title, &request.author, &body),
             )?;
         }
-        render_pdf_cover(&pdf, destination)?;
+        let pdf_for_cover = pdf.clone();
+        let destination_for_cover = destination.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            render_pdf_cover(&pdf_for_cover, &destination_for_cover)
+        })
+        .await??;
         fs::write(
             destination.join("index.html"),
             build_index_html(&request.title, &request.author, &selected),
@@ -1826,10 +1847,9 @@ impl ImportManager {
             summarize_agent_output(&stdout)
         } else if !stderr.trim().is_empty() {
             stderr
-        } else if stdout.trim().is_empty() {
-            "Agent 进程已启动，正在等待首个输出事件".to_string()
         } else {
-            format!("{stdout}\n\n--- stderr ---\n{stderr}")
+            // 走到这里说明 stdout/stderr 均为空但存在 pid 文件：进程已启动，尚未产生输出
+            "Agent 进程已启动，正在等待首个输出事件".to_string()
         };
         let created_at = [&stdout_path, &stderr_path, &process_path]
             .into_iter()
@@ -3524,22 +3544,25 @@ fn needs_chinese_translation(value: &str) -> bool {
     })
 }
 
+// 可翻译正文块标签：提取与回写必须共用同一份列表，避免译文被静默丢弃
+const TRANSLATABLE_BLOCK_TAGS: [&str; 12] = [
+    "p",
+    "li",
+    "blockquote",
+    "pre",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "td",
+    "th",
+];
+
 fn chapter_blocks(html: &str) -> Vec<(String, String, String)> {
     let mut blocks = Vec::new();
-    for tag in [
-        "p",
-        "li",
-        "blockquote",
-        "pre",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "td",
-        "th",
-    ] {
+    for tag in TRANSLATABLE_BLOCK_TAGS {
         let regex = Regex::new(&format!(r#"(?is)<{tag}\b[^>]*\bdata-goodreader-block\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</{tag}\s*>"#)).expect("正文块正则固定有效");
         for captures in regex.captures_iter(html) {
             if let (Some(id), Some(inner)) = (captures.get(1), captures.get(2)) {
@@ -3630,19 +3653,7 @@ fn apply_translations(
                 originals.insert(id, visible_text(&inner));
             }
         }
-        for tag in [
-            "p",
-            "blockquote",
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "h5",
-            "h6",
-            "td",
-            "th",
-            "li",
-        ] {
+        for tag in TRANSLATABLE_BLOCK_TAGS {
             let block_regex = Regex::new(&format!(r#"(?is)(<{tag}\b[^>]*\bdata-goodreader-block\s*=\s*[\"']([^\"']+)[\"'][^>]*>)(.*?)(</{tag}\s*>)"#)).expect("正文替换正则固定有效");
             html = block_regex
                 .replace_all(&html, |captures: &regex::Captures<'_>| {

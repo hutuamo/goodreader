@@ -563,7 +563,7 @@ async fn book_cover(
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let bytes = fs::read(&path).map_err(ApiError::internal)?;
+    let bytes = tokio::fs::read(&path).await.map_err(ApiError::internal)?;
     Ok(asset_response(
         &bytes,
         content_type_for(&extension),
@@ -978,7 +978,9 @@ async fn book_asset(
         .to_ascii_lowercase();
 
     if matches!(extension.as_str(), "html" | "htm") {
-        let html = fs::read_to_string(&path).map_err(ApiError::internal)?;
+        let html = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(ApiError::internal)?;
         let chapter_id = package
             .manifest
             .chapters
@@ -1002,7 +1004,7 @@ async fn book_asset(
         ));
     }
 
-    let bytes = fs::read(&path).map_err(ApiError::internal)?;
+    let bytes = tokio::fs::read(&path).await.map_err(ApiError::internal)?;
     Ok(asset_response(
         &bytes,
         content_type_for(&extension),
@@ -1155,21 +1157,22 @@ async fn list_backups(State(state): State<AppState>) -> Result<Json<Vec<BackupIn
 }
 
 async fn create_backup(State(state): State<AppState>) -> Result<Json<BackupInfo>, ApiError> {
-    Ok(Json(
-        state
-            .database
-            .create_backup("manual")
-            .map_err(ApiError::internal)?,
-    ))
+    let database = state.database.clone();
+    let info = tokio::task::spawn_blocking(move || database.create_backup("manual"))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    Ok(Json(info))
 }
 
 async fn restore_backup(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .database
-        .restore_backup(&name)
+    let database = state.database.clone();
+    tokio::task::spawn_blocking(move || database.restore_backup(&name))
+        .await
+        .map_err(ApiError::internal)?
         .map_err(ApiError::bad_request)?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -399,7 +399,11 @@ impl AgentCoordinator {
         for path in collect_process_files(root) {
             if let Ok(value) = fs::read_to_string(&path) {
                 if let Ok(pid) = value.trim().parse::<u32>() {
-                    terminate_process_group(pid);
+                    // pid 文件可能过期数天，pid 早已被系统复用；
+                    // 仅当占用该 pid 的进程确实先于文件写入启动时才终止，避免误杀无关进程组
+                    if recorded_process_is_current(pid, &path) {
+                        terminate_process_group(pid);
+                    }
                 }
             }
             let _ = fs::remove_file(path);
@@ -1498,6 +1502,52 @@ fn terminate_process_group(pid: u32) {
     let _ = pid;
 }
 
+// pid 文件在子进程启动后立即写入；若当前占用该 pid 的进程启动时间晚于文件修改时间，
+// 说明原进程早已退出、pid 已被复用，不能再按记录终止
+#[cfg(unix)]
+fn recorded_process_is_current(pid: u32, pid_file: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(pid_file) else {
+        return false;
+    };
+    let Ok(recorded_at) = metadata.modified() else {
+        return false;
+    };
+    let Some(started_at) = process_start_time(pid) else {
+        return false;
+    };
+    started_at <= recorded_at
+}
+
+#[cfg(not(unix))]
+fn recorded_process_is_current(_pid: u32, _pid_file: &Path) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    let output = std::process::Command::new("ps")
+        .env("LC_ALL", "C")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ps_lstart(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(unix)]
+fn parse_ps_lstart(value: &str) -> Option<std::time::SystemTime> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let naive = chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y").ok()?;
+    // ps 的 lstart 使用本地时区
+    let local = chrono::TimeZone::from_local_datetime(&chrono::Local, &naive).single()?;
+    Some(local.into())
+}
+
 fn collect_process_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let Ok(entries) = fs::read_dir(root) else {
@@ -1640,8 +1690,8 @@ mod tests {
     use super::{
         chapter_markdown, custom_runtime_spec, execute_claude_translation_command, execute_command,
         execute_command_with_limits, filter_claude_translation_event,
-        parse_claude_translation_stream, run_runtime_instruction, terminate_process_group,
-        truncate, AgentCoordinator,
+        parse_claude_translation_stream, parse_ps_lstart, run_runtime_instruction,
+        terminate_process_group, truncate, AgentCoordinator,
     };
     use crate::db::Database;
     use crate::models::CustomAgentRuntime;
@@ -1664,6 +1714,22 @@ mod tests {
     #[test]
     fn truncates_diagnostic_text_by_character() {
         assert_eq!(truncate("中文错误详情", 4), "中文错误");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_ps_lstart_output() {
+        let parsed = parse_ps_lstart("Fri Aug  7 03:14:15 2026\n").expect("应能解析 lstart 输出");
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 8, 7)
+            .expect("固定日期有效")
+            .and_hms_opt(3, 14, 15)
+            .expect("固定时间有效");
+        let expected = chrono::TimeZone::from_local_datetime(&chrono::Local, &expected)
+            .single()
+            .map(|value| value.into());
+        assert_eq!(Some(parsed), expected);
+        assert!(parse_ps_lstart("").is_none());
+        assert!(parse_ps_lstart("not a date").is_none());
     }
 
     #[tokio::test]
