@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +33,7 @@ const MAX_TRANSLATION_BATCH_BLOCKS: usize = 80;
 const MAX_TRANSLATION_BATCH_CHARS: usize = 12_000;
 const TRANSLATION_BATCH_CONCURRENCY: usize = 2;
 const BOOK_TITLE_TRANSLATION_ID: &str = "goodreader-metadata-book-title";
+const RENDER_WALL_CLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn is_unfinished_import_status(status: &str) -> bool {
     !matches!(status, "completed" | "cancelled")
@@ -2552,7 +2555,7 @@ fn render_online_html(url: &Url) -> Result<String> {
     let chrome = find_chrome()?;
     let profile = std::env::temp_dir().join(format!("goodreader-web-{}", Uuid::new_v4()));
     fs::create_dir_all(&profile)?;
-    let output = Command::new(chrome)
+    let mut child = Command::new(chrome)
         .args([
             "--headless=new",
             "--disable-extensions",
@@ -2565,13 +2568,18 @@ fn render_online_html(url: &Url) -> Result<String> {
         ])
         .arg(format!("--user-data-dir={}", profile.display()))
         .arg(url.as_str())
-        .output();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("无法启动隔离浏览器")?;
+    let status = wait_child_with_timeout(&mut child, RENDER_WALL_CLOCK_TIMEOUT);
     let _ = fs::remove_dir_all(&profile);
-    let output = output?;
-    if !output.status.success() || output.stdout.is_empty() {
+    let status = status?;
+    let stdout = collect_child_stdout(&mut child)?;
+    if !status.success() || stdout.is_empty() {
         bail!("隔离浏览器无法生成稳定页面");
     }
-    String::from_utf8(output.stdout).context("隔离浏览器返回了无效 HTML")
+    Ok(stdout)
 }
 
 fn render_local_html(path: &Path) -> Result<String> {
@@ -2579,7 +2587,7 @@ fn render_local_html(path: &Path) -> Result<String> {
     let profile = std::env::temp_dir().join(format!("goodreader-local-{}", Uuid::new_v4()));
     fs::create_dir_all(&profile)?;
     let url = Url::from_file_path(path).map_err(|_| anyhow!("无法生成本地 HTML URL"))?;
-    let output = Command::new(chrome)
+    let mut child = Command::new(chrome)
         .args([
             "--headless=new",
             "--disable-extensions",
@@ -2592,13 +2600,42 @@ fn render_local_html(path: &Path) -> Result<String> {
         ])
         .arg(format!("--user-data-dir={}", profile.display()))
         .arg(url.as_str())
-        .output();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("无法启动隔离浏览器")?;
+    let status = wait_child_with_timeout(&mut child, RENDER_WALL_CLOCK_TIMEOUT);
     let _ = fs::remove_dir_all(&profile);
-    let output = output?;
-    if !output.status.success() || output.stdout.is_empty() {
+    let status = status?;
+    let stdout = collect_child_stdout(&mut child)?;
+    if !status.success() || stdout.is_empty() {
         bail!("隔离浏览器无法渲染本地 HTML");
     }
-    String::from_utf8(output.stdout).context("隔离浏览器返回了无效 HTML")
+    Ok(stdout)
+}
+
+fn wait_child_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().context("终止挂死的隔离浏览器失败")?;
+            let _ = child.wait();
+            bail!("隔离浏览器渲染超过 {} 秒墙钟上限", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn collect_child_stdout(child: &mut Child) -> Result<String> {
+    let mut bytes = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_end(&mut bytes)
+            .context("读取隔离浏览器输出失败")?;
+    }
+    String::from_utf8(bytes).context("隔离浏览器返回了无效 HTML")
 }
 
 fn find_chrome() -> Result<PathBuf> {
