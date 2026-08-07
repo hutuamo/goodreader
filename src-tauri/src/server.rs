@@ -724,8 +724,20 @@ async fn stream_agent_task_events(
         .map(|task| state.agent.decorate_task(task))
         .ok_or_else(|| ApiError::not_found("Agent 任务不存在"))?;
     let requested_task_id = task_id.clone();
+    let database = state.database.clone();
+    let agent = state.agent.clone();
     let updates = BroadcastStream::new(task_updates).filter_map(move |result| match result {
         Ok(event) if event.task_id() == requested_task_id => Some(event),
+        Err(_) => {
+            // 消费慢导致 broadcast 溢出时重发最新快照，避免运行→完成等关键事件
+            // 丢失后前端停在“运行中”假状态；前端按 sequence 去重，可安全自愈。
+            database
+                .agent_task(&requested_task_id)
+                .ok()
+                .flatten()
+                .map(|task| agent.decorate_task(task))
+                .map(|task| AgentTaskStreamEvent::Snapshot { task })
+        }
         _ => None,
     });
     let stream = tokio_stream::once(AgentTaskStreamEvent::Snapshot { task: current })
