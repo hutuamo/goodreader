@@ -1,5 +1,6 @@
 import MarkdownIt from "markdown-it";
 import { clampNumber, parseClampedSetting } from "./settings";
+import { escapeHtml } from "./reader-utils.mjs";
 
 type Progress = {
   bookId: string;
@@ -217,16 +218,6 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
-}
-
-function escapeHtml(value: string): string {
-  return value.replace(
-    /[&<>"']/g,
-    (character) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[
-        character
-      ] ?? character,
-  );
 }
 
 const aiMarkdown = new MarkdownIt({

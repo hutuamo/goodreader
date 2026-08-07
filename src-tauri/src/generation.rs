@@ -2210,12 +2210,13 @@ fn prepare_html_source(
 }
 
 /// 识别跨页重复的页眉/页脚候选。
-/// 规则刻意收紧：只看每页最靠边缘的 1 行、短文本、且覆盖过半页面，
+/// 规则刻意收紧：只看每页最靠边缘的 1 行、短文本、且覆盖至少 80% 页面，
 /// 避免跨页重复的正文表头/栏目名被标为 removable 后静默省略。
 fn repeated_pdf_lines(pages: &[String]) -> HashSet<String> {
     if pages.is_empty() {
         return HashSet::new();
     }
+    let page_count = pages.len();
     let mut counts = HashMap::<String, usize>::new();
     for page in pages {
         let lines = page
@@ -2233,11 +2234,10 @@ fn repeated_pdf_lines(pages: &[String]) -> HashSet<String> {
             *counts.entry(line).or_default() += 1;
         }
     }
-    // 至少 3 页，且覆盖不少于一半页面
-    let threshold = ((pages.len() + 1) / 2).max(3);
+    let required = page_count.saturating_mul(4).div_ceil(5).max(1);
     counts
         .into_iter()
-        .filter_map(|(line, count)| (count >= threshold).then_some(line))
+        .filter_map(|(line, count)| (count >= required).then_some(line))
         .collect()
 }
 
@@ -2320,6 +2320,17 @@ fn render_pdf_region(
         .status()?;
     if !status.success() || !output.is_file() {
         bail!("无法渲染 PDF 第 {page} 页的完整图片区域");
+    }
+    // 含 /Rotate 90/270 的页面上 poppler 的 -x/-y/-W/-H 坐标语义跨版本不一致，
+    // 输出尺寸与请求不符时说明裁区错位，必须失败而不是静默产出错位裁图（P2-9）。
+    let (width, height) =
+        png_dimensions(output).with_context(|| format!("无法读取 PDF 第 {page} 页裁图尺寸"))?;
+    let expected = (crop.width, crop.height);
+    let rotated = (crop.height, crop.width);
+    if (width, height) != expected && (width, height) != rotated {
+        bail!(
+            "PDF 第 {page} 页裁图尺寸不符：请求 {expected:?}（含旋转 {rotated:?}），实际 {width}×{height}"
+        );
     }
     Ok(())
 }
@@ -4101,7 +4112,7 @@ mod tests {
 
     use super::{
         detect_language, detect_pdf_chapters, discover_chapter_links, pdf_pages_requiring_ocr,
-        validate_translation_map, ImportManager,
+        repeated_pdf_lines, validate_translation_map, ImportManager,
     };
     use crate::agent::AgentCoordinator;
     use crate::db::Database;
@@ -4109,6 +4120,63 @@ mod tests {
         ImportChapterCandidate, ImportPreflight, ImportSourceKind, PdfImportMode,
         StartImportRequest,
     };
+
+    #[test]
+    fn repeated_pdf_lines_does_not_mark_long_body_lines_as_removable() {
+        // 3 页每页顶部同一行较长的正文（>40 字符）：旧规则（每页前 3 行、≤120 字符、≥3 页）
+        // 会误标为可移除，收紧后不得标记（P1-3）。
+        let body_line = "这是每一页顶部都会出现的一段较长正文行，其字符总数显著超过四十个字符的上限，用于演示启发式不得误标正文。";
+        let pages = vec![
+            format!("{body_line}\n正文第二行"),
+            format!("{body_line}\n正文第二行"),
+            format!("{body_line}\n正文第二行"),
+        ];
+        let repeated = repeated_pdf_lines(&pages);
+        assert!(
+            !repeated.contains(body_line),
+            "长正文行不得标记为可移除：{repeated:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_pdf_lines_does_not_mark_lines_inside_the_page() {
+        // 同一行正文出现在每页中部（不是第 1 行 / 最后 1 行）：不得标记。
+        let repeated_line = "表格重复表头：序号 项目 数量";
+        let pages = vec![
+            format!("页眉\n{repeated_line}\n正文"),
+            format!("页眉\n{repeated_line}\n正文"),
+            format!("页眉\n{repeated_line}\n正文"),
+        ];
+        let repeated = repeated_pdf_lines(&pages);
+        assert!(
+            !repeated.contains(repeated_line),
+            "页中重复行不得标记为可移除：{repeated:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_pdf_lines_still_marks_short_headers_on_most_pages() {
+        let pages = vec![
+            "GoodReader 用户手册\n第一章内容".to_string(),
+            "GoodReader 用户手册\n第二章内容".to_string(),
+            "GoodReader 用户手册\n第三章内容".to_string(),
+            "GoodReader 用户手册\n第四章内容".to_string(),
+        ];
+        let repeated = repeated_pdf_lines(&pages);
+        assert!(repeated.contains("GoodReader 用户手册"));
+    }
+
+    #[test]
+    fn repeated_pdf_lines_requires_most_pages() {
+        // 页脚只出现在 1/3 页，不足 80%：不得标记。
+        let pages = vec![
+            "第 1 页\n第一页正文".to_string(),
+            "第二页正文".to_string(),
+            "第三页正文".to_string(),
+        ];
+        let repeated = repeated_pdf_lines(&pages);
+        assert!(!repeated.contains("第 1 页"), "出现页数不足 80% 不得标记");
+    }
 
     #[test]
     fn detects_the_main_narrative_language() {

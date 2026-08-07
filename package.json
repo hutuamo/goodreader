@@ -15,6 +15,7 @@
     "test:reader-display-settings": "node scripts/check-reader-display-settings.mjs",
     "test:reader-typography": "node scripts/check-reader-typography.mjs",
     "test:reader-settings": "node scripts/test-reader-settings.mjs",
+    "test:reader-utils": "node scripts/check-reader-utils.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {

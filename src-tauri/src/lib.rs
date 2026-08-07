@@ -14,6 +14,7 @@ use std::time::Duration;
 use anyhow::Context;
 use parking_lot::Mutex;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+
 pub fn run() {
     let shutdown = Arc::new(Mutex::new(None));
     let shutdown_for_setup = shutdown.clone();
