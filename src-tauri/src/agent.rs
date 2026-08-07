@@ -802,6 +802,15 @@ impl AgentCoordinator {
 
         let mut chapter_index = String::new();
         for chapter in &package.manifest.chapters {
+            // chapter.id 直接拼成 chapters/<id>.md 文件名，拒绝含路径分隔符或
+            // 父目录引用的标识，防止恶意书籍包把文件写到工作区之外。
+            if chapter.id.is_empty()
+                || chapter.id.contains('/')
+                || chapter.id.contains('\\')
+                || chapter.id.contains("..")
+            {
+                bail!("章节标识含有非法字符：{}", chapter.id);
+            }
             let source = resolve_package_file(&package.root, &chapter.path)?;
             let html = fs::read_to_string(&source)
                 .with_context(|| format!("无法读取章节 {}", source.display()))?;
