@@ -18,10 +18,12 @@ for (const marker of requiredMarkers) {
   if (!source.includes(marker)) throw new Error(`选区问 AI 缺少实现：${marker}`);
 }
 
-const implementation = source.slice(
-  source.indexOf("function askAiAboutSelection"),
-  source.indexOf("async function updateParallelButton"),
-);
+// 用正则提取 askAiAboutSelection 的函数体，并在找不到时直接抛错。
+// 之前的 indexOf + slice 写法在任一边界缺失时会得到空串，使下方的负向断言
+// 恒为真，测试看似通过却什么都没检查。
+const match = source.match(/function askAiAboutSelection\(\): void \{[\s\S]*?\n\}/);
+if (!match) throw new Error("找不到 askAiAboutSelection 实现");
+const implementation = match[0];
 
 if (implementation.includes("submitAiQuestion") || implementation.includes(".gr-ai-send")) {
   throw new Error("选区问 AI 不应自动发送问题");
