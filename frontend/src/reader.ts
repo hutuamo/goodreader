@@ -1,5 +1,7 @@
 import MarkdownIt from "markdown-it";
 
+import { parseClampedSetting } from "./settings";
+
 type Progress = {
   bookId: string;
   chapterId: string;
@@ -2124,12 +2126,19 @@ async function boot(): Promise<void> {
       aiSendKey = savedAiSendKey;
     }
     topbarPinned = savedTopbarPinned === "true";
-    const parsedFontSize = Number(savedFontSize);
-    if (Number.isFinite(parsedFontSize)) readerFontSize = clampNumber(parsedFontSize, 80, 160);
-    const parsedSidebarWidth = Number(savedSidebarWidth);
-    if (Number.isFinite(parsedSidebarWidth)) sidebarWidth = parsedSidebarWidth;
-    const parsedAiSidebarWidth = Number(savedAiSidebarWidth);
-    if (Number.isFinite(parsedAiSidebarWidth)) aiSidebarWidth = parsedAiSidebarWidth;
+    readerFontSize = parseClampedSetting(savedFontSize, 100, 80, 160);
+    sidebarWidth = parseClampedSetting(
+      savedSidebarWidth,
+      sidebarWidthLimits.toc.default,
+      sidebarWidthLimits.toc.min,
+      sidebarWidthLimits.toc.max,
+    );
+    aiSidebarWidth = parseClampedSetting(
+      savedAiSidebarWidth,
+      sidebarWidthLimits.ai.default,
+      sidebarWidthLimits.ai.min,
+      sidebarWidthLimits.ai.max,
+    );
     aiViewState = restoreAiViewState();
     restoreAiWorkspaceCache();
     applyBookLanguage();
