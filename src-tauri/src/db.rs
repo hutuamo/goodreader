@@ -111,6 +111,9 @@ impl Database {
             CREATE INDEX IF NOT EXISTS agent_task_book_updated
             ON agent_tasks(book_id, updated_at DESC);
 
+            CREATE UNIQUE INDEX IF NOT EXISTS agent_task_active_book
+            ON agent_tasks(book_id) WHERE status NOT IN ('completed', 'stopped');
+
             CREATE TABLE IF NOT EXISTS agent_executions (
                 id TEXT PRIMARY KEY NOT NULL,
                 task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
@@ -369,6 +372,20 @@ impl Database {
         Ok((progress, annotations))
     }
 
+    /// 应用启动时把上次崩溃遗留的进行中问题任务标记为暂停，
+    /// 避免 UI 永远显示「处理中」（与导入任务侧 recover_interrupted_tasks 对齐）。
+    pub fn recover_stale_question_tasks(&self) -> Result<usize> {
+        let now = Utc::now().timestamp_millis();
+        let connection = self.connection.lock().expect("数据库互斥锁");
+        let changed = connection.execute(
+            "UPDATE agent_tasks
+             SET status = 'paused', error = '应用上次退出时任务未完成，已暂停', updated_at = ?1
+             WHERE kind = 'question' AND status IN ('queued', 'running')",
+            [now],
+        )?;
+        Ok(changed)
+    }
+
     pub fn clear_ai_workspace(&self, book_id: &str) -> Result<usize> {
         let mut connection = self.connection.lock().expect("数据库互斥锁");
         let transaction = connection.transaction()?;
@@ -446,12 +463,18 @@ impl Database {
         let message_id = Uuid::new_v4().to_string();
         let mut connection = self.connection.lock().expect("数据库互斥锁");
         let transaction = connection.transaction()?;
-        transaction.execute(
+        let insert = transaction.execute(
             "INSERT INTO agent_tasks(
                 id, book_id, kind, status, goal, current_runtime_id, error, created_at, updated_at
              ) VALUES (?1, ?2, 'question', 'queued', ?3, ?4, NULL, ?5, ?5)",
             params![task_id, book_id, goal, runtime_id, now],
-        )?;
+        );
+        if let Err(error) = insert {
+            if is_active_task_conflict(&error) {
+                bail!("这本书已有正在进行的 AI 请求，请先等待完成或停止当前请求");
+            }
+            return Err(error.into());
+        }
         transaction.execute(
             "INSERT INTO ai_messages(
                 id, book_id, task_id, role, content, runtime_id, created_at
@@ -800,6 +823,17 @@ impl Database {
             bail!("备份不存在");
         }
 
+        // 覆盖前先只读检查源备份 schema 版本：更高版本备份会破坏当前活动库，
+        // 必须在写任何数据之前拒绝（P2-4）。
+        let version_source =
+            Connection::open_with_flags(&source_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let source_version: i64 =
+            version_source.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        drop(version_source);
+        if source_version > SCHEMA_VERSION {
+            bail!("备份数据库版本 {source_version} 高于当前应用支持的 {SCHEMA_VERSION}，无法恢复");
+        }
+
         self.create_backup("before-restore")?;
         let source =
             Connection::open_with_flags(&source_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -850,6 +884,14 @@ impl Database {
             size: metadata.len(),
         })
     }
+}
+
+fn is_active_task_conflict(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::ConstraintViolation
+    )
 }
 
 fn validate_annotation(input: &CreateAnnotation) -> Result<()> {
@@ -971,6 +1013,8 @@ fn map_ai_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiMessage> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tempfile::TempDir;
 
     use super::Database;
@@ -1050,6 +1094,30 @@ mod tests {
         assert_eq!(database.annotation_count("book").expect("计数"), 1);
         database.forget_book("book").expect("永久忘记");
         assert_eq!(database.annotation_count("book").expect("计数"), 0);
+    }
+
+    #[test]
+    fn rejects_a_second_concurrent_question_task_for_the_same_book() {
+        let temp = TempDir::new().expect("临时目录");
+        let database = Arc::new(Database::open(temp.path()).expect("打开数据库"));
+        let database_a = database.clone();
+        let database_b = database.clone();
+        let handle_a =
+            std::thread::spawn(move || database_a.create_question_task("book", "codex", "问题一"));
+        let handle_b =
+            std::thread::spawn(move || database_b.create_question_task("book", "codex", "问题二"));
+        let result_a = handle_a.join().expect("线程 A");
+        let result_b = handle_b.join().expect("线程 B");
+        let ok_count = [&result_a, &result_b]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count();
+        assert_eq!(ok_count, 1, "同一本书同一时刻只能有一个活跃任务");
+        let conflict_detected = [result_a, result_b].iter().any(|result| match result {
+            Err(error) => format!("{error:#}").contains("已有正在进行的 AI 请求"),
+            Ok(_) => false,
+        });
+        assert!(conflict_detected, "另一个任务应报告并发冲突");
     }
 
     #[test]

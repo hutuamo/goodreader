@@ -47,6 +47,7 @@ const APP_CSS: &[u8] = include_bytes!("../../frontend/dist/assets/app.css");
 const READER_JS: &[u8] = include_bytes!("../../frontend/dist/assets/reader.js");
 const READER_CSS: &[u8] = include_bytes!("../../frontend/dist/assets/reader.css");
 const MAX_COVER_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_COVER_DIMENSION: u32 = 8192;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -129,6 +130,8 @@ pub async fn start(
         .unwrap_or(&agent_tasks_dir)
         .join("CoverOverrides");
     let agent = Arc::new(AgentCoordinator::new(agent_tasks_dir, database.clone())?);
+    // 应用启动时恢复上次崩溃遗留的问题任务，避免 UI 永远显示「处理中」（P3）。
+    database.recover_stale_question_tasks()?;
     let imports = Arc::new(ImportManager::new(
         import_tasks_dir,
         books_dir.clone(),
@@ -724,9 +727,22 @@ async fn stream_agent_task_events(
         .map(|task| state.agent.decorate_task(task))
         .ok_or_else(|| ApiError::not_found("Agent 任务不存在"))?;
     let requested_task_id = task_id.clone();
+    let database = state.database.clone();
+    let agent = state.agent.clone();
     let updates = BroadcastStream::new(task_updates).filter_map(move |result| match result {
         Ok(event) if event.task_id() == requested_task_id => Some(event),
-        _ => None,
+        Ok(_) => None,
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => {
+            // 高吞吐或客户端短暂阻塞会丢弃增量：改发最新快照，
+            // 前端按 stream_sequence 去重即可自愈（P2-8）。
+            database
+                .agent_task(&requested_task_id)
+                .ok()
+                .flatten()
+                .map(|task| AgentTaskStreamEvent::Snapshot {
+                    task: agent.decorate_task(task),
+                })
+        }
     });
     let stream = tokio_stream::once(AgentTaskStreamEvent::Snapshot { task: current })
         .chain(updates)
@@ -925,6 +941,8 @@ async fn delete_book_package(
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)?;
+    // 删除书籍副本时一并清理封面覆盖，避免残留文件与书籍身份语义不一致（P3）。
+    remove_cover_override(&state.cover_overrides_dir, &book_id).map_err(ApiError::internal)?;
 
     let catalog = scan_books(&state.books_dir);
     *state.catalog.write().expect("书库写锁") = catalog;
@@ -1279,6 +1297,28 @@ fn cover_image_format(bytes: &[u8]) -> Option<CoverImageFormat> {
     }
 }
 
+fn validate_cover_image(bytes: &[u8]) -> Result<()> {
+    // 第一阶段只读头部尺寸，不分配像素内存：拦截巨幅图片头（解压炸弹）。
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("无法解析封面图片格式")?;
+    let (width, height) = reader
+        .into_dimensions()
+        .context("封面图片损坏或尺寸信息缺失")?;
+    if width > MAX_COVER_DIMENSION || height > MAX_COVER_DIMENSION {
+        bail!(
+            "封面图片尺寸过大（{width}×{height}），不能超过 {MAX_COVER_DIMENSION}×{MAX_COVER_DIMENSION} 像素"
+        );
+    }
+    // 第二阶段完整解码，确认文件不是伪造头部。
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("无法解析封面图片格式")?
+        .decode()
+        .context("封面图片解码失败")?;
+    Ok(())
+}
+
 fn cover_override_path(root: &Path, book_id: &str) -> Option<PathBuf> {
     ["png", "jpg", "gif", "webp"]
         .into_iter()
@@ -1297,6 +1337,8 @@ fn save_cover_override(root: &Path, book_id: &str, source: &Path) -> Result<()> 
     let bytes = fs::read(source).context("无法读取封面图片")?;
     let format =
         cover_image_format(&bytes).context("仅支持 PNG、JPEG、GIF 或 WebP 格式的封面图片")?;
+    // 完整解码并校验像素上限，防止巨幅图片头冻结 WebView（P2-6）。
+    validate_cover_image(&bytes)?;
     fs::create_dir_all(root).context("无法创建封面覆盖目录")?;
     let temporary = root.join(format!("{book_id}.tmp"));
     fs::write(&temporary, bytes).context("无法暂存新封面")?;
@@ -1572,7 +1614,12 @@ mod tests {
     fn saves_a_valid_cover_without_modifying_the_book_package() {
         let root = tempdir().unwrap();
         let source = root.path().join("selected-image");
-        fs::write(&source, b"\x89PNG\r\n\x1a\ncover-data").unwrap();
+        // 1x1 透明 PNG：P2-6 起封面需要完整解码校验，伪魔数数据会被拒绝。
+        fs::write(
+            &source,
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0aIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\x0d\x0a\x2d\xb4\x00\x00\x00\x00IEND\xaeB\x60\x82",
+        )
+        .unwrap();
         let overrides = root.path().join("CoverOverrides");
 
         save_cover_override(&overrides, "book-id", &source).unwrap();

@@ -227,7 +227,9 @@ fn validate_layout(layout: &PdfPageLayout, source: &PdfPageSource) -> Result<()>
     if !missing.is_empty() {
         bail!("Agent 页面排版遗漏来源行：{}", missing.join(", "));
     }
-    if layout.blocks.is_empty() && !source.lines.is_empty() {
+    if layout.blocks.is_empty() {
+        // 空 blocks 一律拒绝：纯矢量整页插图页也可能被 Agent 返回空排版，
+        // 静默通过会产生空白 <section class="pdf-page">（P2-3）。
         bail!("Agent 没有生成任何页面内容");
     }
     if source.requires_figure && figure_count == 0 {

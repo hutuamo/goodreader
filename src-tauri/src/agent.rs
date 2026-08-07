@@ -12,7 +12,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch, Mutex as AsyncMutex};
 
 use crate::agent_session::{
     AgentSessionHost, ExecutionControl, ProviderExecutionEvent, ProviderKind, SessionConfig,
@@ -37,6 +37,7 @@ pub struct AgentCoordinator {
     active_processes: Arc<Mutex<HashMap<PathBuf, u32>>>,
     active_questions: Arc<Mutex<HashMap<String, ExecutionControl>>>,
     live_tasks: Arc<Mutex<HashMap<String, LiveTaskState>>>,
+    book_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     sessions: AgentSessionHost,
     task_updates: broadcast::Sender<AgentTaskStreamEvent>,
 }
@@ -134,6 +135,7 @@ impl AgentCoordinator {
             active_processes: Arc::new(Mutex::new(HashMap::new())),
             active_questions: Arc::new(Mutex::new(HashMap::new())),
             live_tasks: Arc::new(Mutex::new(HashMap::new())),
+            book_locks: Arc::new(Mutex::new(HashMap::new())),
             sessions: AgentSessionHost::new(),
             task_updates,
         })
@@ -206,6 +208,7 @@ impl AgentCoordinator {
             true,
             Some(&logs),
             Some(&self.active_processes),
+            None,
         )
         .await?;
         Ok(())
@@ -356,6 +359,7 @@ impl AgentCoordinator {
                 uses_stdin,
                 Some(&logs),
                 Some(&self.active_processes),
+                None,
             )
             .await?
         };
@@ -474,16 +478,30 @@ impl AgentCoordinator {
         {
             control.cancel();
         }
+        // 原生会话路径按任务 id 登记进程；legacy 路径按
+        // Sessions/<hex(book_id)>/workspace 登记，两个键都查。
         let workspace = self.tasks_dir.join(task_id);
-        if let Some(pid) = self
-            .active_processes
-            .lock()
-            .expect("Agent 活动进程锁")
-            .get(&workspace)
-            .copied()
-        {
-            terminate_process_group(pid);
+        let session_workspace = {
+            let mut session_directory = String::with_capacity(task.book_id.len() * 2);
+            for byte in task.book_id.as_bytes() {
+                session_directory
+                    .push(char::from_digit(u32::from(byte >> 4), 16).expect("十六进制数字"));
+                session_directory
+                    .push(char::from_digit(u32::from(byte & 0x0f), 16).expect("十六进制数字"));
+            }
+            self.tasks_dir
+                .join("Sessions")
+                .join(session_directory)
+                .join("workspace")
+        };
+        let mut processes = self.active_processes.lock().expect("Agent 活动进程锁");
+        for key in [&workspace, &session_workspace] {
+            if let Some(pid) = processes.get(key).copied() {
+                terminate_process_group(pid);
+                processes.remove(key);
+            }
         }
+        drop(processes);
         self.publish_task(task_id);
         Ok(task)
     }
@@ -528,6 +546,17 @@ impl AgentCoordinator {
         task: &AgentTask,
         control: &ExecutionControl,
     ) -> Result<()> {
+        // 同书所有问题任务共享工作区，串行化 prepare_workspace 与会话执行，
+        // 避免后启动的任务覆盖旧 turn 尚未读取的上下文（P1-2）。
+        let book_lock = self.book_lock(&task.book_id).await;
+        let _book_guard = book_lock.lock().await;
+        if self
+            .database
+            .agent_task(&task.id)?
+            .is_some_and(|current| current.status == "stopped")
+        {
+            bail!("Agent 任务已停止");
+        }
         let runtime = self.runtime_spec(&task.current_runtime_id)?;
         let execution_id = self.database.start_agent_execution(&task.id, &runtime.id)?;
 
@@ -548,7 +577,13 @@ impl AgentCoordinator {
                 self.run_native_question(&runtime, task, &workspace, control)
                     .await?
             } else {
-                let output = run_runtime(&runtime, &workspace, &self.active_processes).await?;
+                let output = run_runtime(
+                    &runtime,
+                    &workspace,
+                    &self.active_processes,
+                    Some(control.subscribe()),
+                )
+                .await?;
                 if let Some(live) = self
                     .live_tasks
                     .lock()
@@ -735,6 +770,15 @@ impl AgentCoordinator {
         custom_runtime_spec(custom)
     }
 
+    async fn book_lock(&self, book_id: &str) -> Arc<AsyncMutex<()>> {
+        self.book_locks
+            .lock()
+            .expect("书籍任务锁表")
+            .entry(book_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
     fn prepare_workspace(
         &self,
         package: &BookPackage,
@@ -916,6 +960,7 @@ async fn run_runtime(
     runtime: &RuntimeSpec,
     workspace: &Path,
     active_processes: &Arc<Mutex<HashMap<PathBuf, u32>>>,
+    cancel: Option<watch::Receiver<bool>>,
 ) -> Result<RuntimeOutput> {
     let instruction = "请阅读 context/current.md，并完成其中的 GoodReader 书籍问答任务。";
     run_runtime_instruction(
@@ -925,6 +970,7 @@ async fn run_runtime(
         false,
         None,
         Some(active_processes),
+        cancel,
     )
     .await
 }
@@ -936,6 +982,7 @@ async fn run_runtime_instruction(
     writable: bool,
     live_logs: Option<&Path>,
     active_processes: Option<&Arc<Mutex<HashMap<PathBuf, u32>>>>,
+    cancel: Option<watch::Receiver<bool>>,
 ) -> Result<RuntimeOutput> {
     let mut command = Command::new(&runtime.executable);
     command.current_dir(workspace);
@@ -1001,6 +1048,7 @@ async fn run_runtime_instruction(
         uses_stdin,
         live_logs,
         active_processes,
+        cancel,
     )
     .await?;
     if matches!(runtime.kind, RuntimeKind::OpenCode) {
@@ -1036,6 +1084,7 @@ async fn execute_command(
     uses_stdin: bool,
     live_logs: Option<&Path>,
     active_processes: Option<&Arc<Mutex<HashMap<PathBuf, u32>>>>,
+    cancel: Option<watch::Receiver<bool>>,
 ) -> Result<RuntimeOutput> {
     execute_command_with_limits(
         command,
@@ -1044,6 +1093,7 @@ async fn execute_command(
         uses_stdin,
         live_logs,
         active_processes,
+        cancel,
         EXECUTION_TIMEOUT,
         NETWORK_FAILURE_TIMEOUT,
     )
@@ -1057,6 +1107,7 @@ async fn execute_command_with_limits(
     uses_stdin: bool,
     live_logs: Option<&Path>,
     active_processes: Option<&Arc<Mutex<HashMap<PathBuf, u32>>>>,
+    cancel: Option<watch::Receiver<bool>>,
     execution_timeout: Duration,
     network_failure_timeout: Duration,
 ) -> Result<RuntimeOutput> {
@@ -1105,9 +1156,23 @@ async fn execute_command_with_limits(
     let mut forced_error = None;
     let mut monitor = tokio::time::interval(Duration::from_millis(50));
     monitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut cancel_receiver = cancel;
     let status = loop {
         tokio::select! {
             status = child.wait() => break Some(status?),
+            _ = async {
+                if let Some(receiver) = cancel_receiver.as_mut() {
+                    let _ = receiver.changed().await;
+                }
+            }, if cancel_receiver.is_some() => {
+                if cancel_receiver
+                    .as_ref()
+                    .is_some_and(|receiver| *receiver.borrow())
+                {
+                    forced_error = Some("Agent 任务已停止".to_string());
+                    break None;
+                }
+            }
             _ = monitor.tick() => {
                 if network_failure.load(Ordering::Relaxed) && network_failure_started.is_none() {
                     network_failure_started = Some(Instant::now());
@@ -1644,7 +1709,7 @@ mod tests {
         truncate, AgentCoordinator,
     };
     use crate::db::Database;
-    use crate::models::CustomAgentRuntime;
+    use crate::models::{BookManifest, BookPackage, ChapterManifest, CustomAgentRuntime};
 
     #[test]
     fn builds_a_book_view_with_stable_block_ids() {
@@ -1703,6 +1768,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"session-1","part":{"type":"ste
                 false,
                 None,
                 None,
+                None,
             ),
         )
         .await
@@ -1750,7 +1816,7 @@ exit 2
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let error = match execute_command(command, temp.path(), "", true, None, None).await {
+        let error = match execute_command(command, temp.path(), "", true, None, None, None).await {
             Ok(_) => panic!("运行时应失败"),
             Err(error) => error,
         };
@@ -1788,6 +1854,7 @@ sleep 30
             temp.path(),
             "question",
             true,
+            None,
             None,
             None,
             Duration::from_secs(5),
@@ -1836,6 +1903,7 @@ sleep 0.3
             true,
             None,
             None,
+            None,
             Duration::from_secs(5),
             Duration::from_millis(150),
         )
@@ -1873,6 +1941,7 @@ sleep 0.3
                 true,
                 None,
                 Some(&active_for_run),
+                None,
             )
             .await
         });
@@ -1995,5 +2064,126 @@ sleep 30
         assert_eq!(result.translations, blocks);
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(!workspace.join("logs/process.pid").exists());
+    }
+
+    #[tokio::test]
+    async fn stop_question_terminates_legacy_runtime_process() {
+        let temp = TempDir::new().expect("临时目录");
+        let executable = temp.path().join("fake-agent.sh");
+        fs::write(&executable, "#!/bin/sh\ncat >/dev/null\nsleep 30\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let database = Arc::new(Database::open(&temp.path().join("Data")).unwrap());
+        let runtime = database
+            .save_custom_agent_runtime("假 Agent", executable.to_str().unwrap(), &[])
+            .unwrap();
+        let book_id = "test-book-1234".to_string();
+        let book_root = temp.path().join("Book");
+        let chapters_dir = book_root.join("chapters");
+        fs::create_dir_all(&chapters_dir).unwrap();
+        fs::write(
+            chapters_dir.join("chapter-1.html"),
+            "<main data-goodreader-content><p data-goodreader-block=\"b1\">正文</p></main>",
+        )
+        .unwrap();
+        let package = BookPackage {
+            root: book_root.canonicalize().expect("书籍目录规范路径"),
+            manifest: BookManifest {
+                schema_version: 1,
+                id: book_id.clone(),
+                title: "测试书".to_string(),
+                original_title: None,
+                author: "作者".to_string(),
+                language: None,
+                source_language: None,
+                target_language: None,
+                cover: "cover.png".to_string(),
+                entry: "index.html".to_string(),
+                chapters: vec![ChapterManifest {
+                    id: "chapter-1".to_string(),
+                    title: "第一章".to_string(),
+                    path: "chapters/chapter-1.html".to_string(),
+                    parallel_text: None,
+                }],
+            },
+        };
+        let task = database
+            .create_question_task(&book_id, &runtime.id, "测试问题")
+            .expect("创建问题任务");
+        let coordinator =
+            Arc::new(AgentCoordinator::new(temp.path().join("Tasks"), database).unwrap());
+        let started = Instant::now();
+        coordinator
+            .clone()
+            .start_question(package, Vec::new(), task.clone());
+
+        // 等待 legacy 进程登记到 Sessions/<hex(book_id)>/workspace 键
+        let session_directory = book_id
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let workspace = temp
+            .path()
+            .join("Tasks/Sessions")
+            .join(&session_directory)
+            .join("workspace");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if coordinator
+                    .active_processes
+                    .lock()
+                    .expect("Agent 活动进程锁")
+                    .contains_key(&workspace)
+                {
+                    break;
+                }
+                if let Some(current) = coordinator
+                    .database
+                    .agent_task(&task.id)
+                    .expect("查询任务状态")
+                {
+                    if current.status == "paused" || current.status == "errored" {
+                        panic!(
+                            "任务提前失败：{:?}",
+                            current.error.as_deref().unwrap_or("无错误信息")
+                        );
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("legacy 进程应登记到 Sessions 工作区键");
+
+        coordinator
+            .stop_question(&task.id)
+            .expect("停止问题任务应成功");
+
+        // 秒级退出：等待实时任务表清空（执行循环已结束）
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if coordinator
+                    .live_tasks
+                    .lock()
+                    .expect("Agent 实时状态锁")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("停止后任务应秒级结束");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let current = coordinator
+            .database
+            .agent_task(&task.id)
+            .unwrap()
+            .expect("任务仍存在");
+        assert_eq!(current.status, "stopped");
     }
 }

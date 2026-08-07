@@ -139,7 +139,7 @@ impl ExecutionControl {
         }
     }
 
-    fn subscribe(&self) -> watch::Receiver<bool> {
+    pub fn subscribe(&self) -> watch::Receiver<bool> {
         self.cancel.subscribe()
     }
 
@@ -174,6 +174,7 @@ pub struct AgentSessionHost {
 struct SessionSlot {
     instance_id: String,
     backend: AsyncMutex<ProviderBackend>,
+    active_control: Mutex<Option<ExecutionControl>>,
 }
 
 enum ProviderBackend {
@@ -213,6 +214,7 @@ impl AgentSessionHost {
                                 ProviderBackend::OpenCode(OpenCodeSession::new(&config))
                             }
                         }),
+                        active_control: Mutex::new(None),
                     })
                 })
                 .clone()
@@ -225,6 +227,8 @@ impl AgentSessionHost {
         let execution_id_for_task = execution_id.clone();
         let turn_id_for_task = turn_id.clone();
         let control_for_task = control.clone();
+        // 记录当前 turn 的控制句柄：dispose_book 先 cancel 再等后端锁（P2-7）。
+        *slot.active_control.lock().expect("Agent 会话控制锁") = Some(control.clone());
 
         tokio::spawn(async move {
             let emitter = EventEmitter::new(
@@ -290,6 +294,14 @@ impl AgentSessionHost {
                 .filter_map(|key| sessions.remove(&key))
                 .collect::<Vec<_>>()
         };
+        // 先取消该书全部活跃 turn：不 cancel 的话后端锁会被 turn 持有到
+        // TURN_TIMEOUT（最长 30 分钟），清除请求会一直挂起（P2-7）。
+        for slot in &slots {
+            if let Some(control) = slot.active_control.lock().expect("Agent 会话控制锁").take()
+            {
+                control.cancel();
+            }
+        }
         for slot in slots {
             slot.backend.lock().await.dispose().await;
         }

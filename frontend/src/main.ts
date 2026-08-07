@@ -807,8 +807,8 @@ async function showImportConfiguration(preflight: ImportPreflight): Promise<void
       </section>
       <section class="translation-options ${isChinese ? "disabled" : ""}">
         <label class="option-row">
-          <input id="translateBook" type="checkbox" ${isChinese || !availableRuntimes.length ? "disabled" : ""} />
-          <span><strong>翻译为简体中文</strong><small>${isChinese ? "来源已经是中文，不需要翻译" : availableRuntimes.length ? "由本机 Agent 完成，耗时长于仅转换" : "没有可用 Agent，请先在设置中配置"}</small></span>
+          <input id="translateBook" type="checkbox" ${isChinese || needsLayoutAgent || !availableRuntimes.length ? "disabled" : ""} />
+          <span><strong>翻译为简体中文</strong><small>${isChinese ? "来源已经是中文，不需要翻译" : needsLayoutAgent ? "PDF 来源暂不支持翻译，仅由 Agent 排版正文" : availableRuntimes.length ? "由本机 Agent 完成，耗时长于仅转换" : "没有可用 Agent，请先在设置中配置"}</small></span>
         </label>
         <label class="option-row">
           <input id="preserveOriginal" type="checkbox" disabled />

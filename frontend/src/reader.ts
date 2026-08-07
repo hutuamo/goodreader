@@ -1,4 +1,5 @@
 import MarkdownIt from "markdown-it";
+import { clampNumber, escapeHtml, parseFiniteNumber } from "./reader-utils.mjs";
 
 type Progress = {
   bookId: string;
@@ -218,16 +219,6 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   return (await response.json()) as T;
 }
 
-function escapeHtml(value: string): string {
-  return value.replace(
-    /[&<>"']/g,
-    (character) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[
-        character
-      ] ?? character,
-  );
-}
-
 const aiMarkdown = new MarkdownIt({
   html: false,
   linkify: true,
@@ -300,10 +291,6 @@ function applyReaderTheme(): void {
   toggle.setAttribute("aria-label", `切换到${nextTheme}模式`);
   toggle.title = `切换到${nextTheme}模式`;
   toggle.setAttribute("aria-pressed", String(theme === "dark"));
-}
-
-function clampNumber(value: number, minimum: number, maximum: number): number {
-  return Math.max(minimum, Math.min(maximum, value));
 }
 
 function readerTextElements(): HTMLElement[] {
@@ -2124,12 +2111,12 @@ async function boot(): Promise<void> {
       aiSendKey = savedAiSendKey;
     }
     topbarPinned = savedTopbarPinned === "true";
-    const parsedFontSize = Number(savedFontSize);
-    if (Number.isFinite(parsedFontSize)) readerFontSize = clampNumber(parsedFontSize, 80, 160);
-    const parsedSidebarWidth = Number(savedSidebarWidth);
-    if (Number.isFinite(parsedSidebarWidth)) sidebarWidth = parsedSidebarWidth;
-    const parsedAiSidebarWidth = Number(savedAiSidebarWidth);
-    if (Number.isFinite(parsedAiSidebarWidth)) aiSidebarWidth = parsedAiSidebarWidth;
+    const parsedFontSize = parseFiniteNumber(savedFontSize);
+    if (parsedFontSize !== null) readerFontSize = clampNumber(parsedFontSize, 80, 160);
+    const parsedSidebarWidth = parseFiniteNumber(savedSidebarWidth);
+    if (parsedSidebarWidth !== null) sidebarWidth = parsedSidebarWidth;
+    const parsedAiSidebarWidth = parseFiniteNumber(savedAiSidebarWidth);
+    if (parsedAiSidebarWidth !== null) aiSidebarWidth = parsedAiSidebarWidth;
     aiViewState = restoreAiViewState();
     restoreAiWorkspaceCache();
     applyBookLanguage();
