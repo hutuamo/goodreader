@@ -2,11 +2,17 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::agent::AgentCoordinator;
+use crate::agent::{
+    classify_agent_failure, transient_agent_retry_delay, AgentCoordinator, AgentFailureClass,
+    MAX_TRANSIENT_AGENT_ATTEMPTS,
+};
+
+const MAX_INVALID_OUTPUT_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +54,16 @@ pub struct ComposedPdfPage {
     pub html: String,
     pub figures: Vec<ComposedPdfFigure>,
     pub reused: bool,
+    pub attempts: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PdfPageRetry {
+    pub failed_attempt: usize,
+    pub next_attempt: usize,
+    pub max_attempts: usize,
+    pub delay_ms: u64,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,12 +111,29 @@ impl PdfPageComposer {
         Self { agent }
     }
 
+    #[cfg(test)]
     pub async fn compose(
         &self,
         runtime_id: &str,
         workspace: &Path,
         source: &PdfPageSource,
     ) -> Result<ComposedPdfPage> {
+        self.compose_with_retry(runtime_id, workspace, source, |_| Ok(()), || Ok(()))
+            .await
+    }
+
+    pub async fn compose_with_retry<F, C>(
+        &self,
+        runtime_id: &str,
+        workspace: &Path,
+        source: &PdfPageSource,
+        mut on_retry: F,
+        mut checkpoint: C,
+    ) -> Result<ComposedPdfPage>
+    where
+        F: FnMut(&PdfPageRetry) -> Result<()>,
+        C: FnMut() -> Result<()>,
+    {
         let input_dir = workspace.join("input");
         let output_dir = workspace.join("output");
         fs::create_dir_all(&input_dir)?;
@@ -128,16 +161,99 @@ impl PdfPageComposer {
         }
 
         if let Ok(layout) = read_and_validate_layout(&result_path, source) {
-            return materialize_layout(layout, source, true);
+            return materialize_layout(layout, source, true, 0);
         }
 
         let instruction = page_composition_instruction(source.page);
-        self.agent
-            .run_generation(runtime_id, workspace, &instruction)
-            .await
-            .with_context(|| format!("PDF 第 {} 页 Agent 排版失败", source.page))?;
-        let layout = read_and_validate_layout(&result_path, source)?;
-        materialize_layout(layout, source, false)
+        let mut attempt = 1usize;
+        let mut invalid_output_attempts = 0usize;
+        loop {
+            checkpoint()?;
+            if result_path.exists() {
+                fs::remove_file(&result_path)?;
+            }
+            match self
+                .agent
+                .run_generation(runtime_id, workspace, &instruction)
+                .await
+            {
+                Ok(()) => match read_and_validate_layout(&result_path, source) {
+                    Ok(layout) => return materialize_layout(layout, source, false, attempt),
+                    Err(error) => {
+                        invalid_output_attempts += 1;
+                        if invalid_output_attempts >= MAX_INVALID_OUTPUT_ATTEMPTS
+                            || attempt >= MAX_TRANSIENT_AGENT_ATTEMPTS
+                        {
+                            return Err(error).with_context(|| {
+                                format!("PDF 第 {} 页 Agent 排版结果校验失败", source.page)
+                            });
+                        }
+                        let delay = invalid_output_retry_delay(invalid_output_attempts);
+                        let max_attempts = attempt
+                            .saturating_add(
+                                MAX_INVALID_OUTPUT_ATTEMPTS.saturating_sub(invalid_output_attempts),
+                            )
+                            .min(MAX_TRANSIENT_AGENT_ATTEMPTS);
+                        let retry = PdfPageRetry {
+                            failed_attempt: attempt,
+                            next_attempt: attempt + 1,
+                            max_attempts,
+                            delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                            reason: format!("{error:#}"),
+                        };
+                        on_retry(&retry)?;
+                        wait_for_retry(delay, &mut checkpoint).await?;
+                        attempt += 1;
+                    }
+                },
+                Err(error) => {
+                    if classify_agent_failure(&error) != AgentFailureClass::Transient
+                        || attempt >= MAX_TRANSIENT_AGENT_ATTEMPTS
+                    {
+                        return Err(error)
+                            .with_context(|| format!("PDF 第 {} 页 Agent 排版失败", source.page));
+                    }
+                    let delay = transient_agent_retry_delay(attempt);
+                    let retry = PdfPageRetry {
+                        failed_attempt: attempt,
+                        next_attempt: attempt + 1,
+                        max_attempts: MAX_TRANSIENT_AGENT_ATTEMPTS,
+                        delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        reason: format!("{error:#}"),
+                    };
+                    on_retry(&retry)?;
+                    wait_for_retry(delay, &mut checkpoint).await?;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+}
+
+fn invalid_output_retry_delay(failed_attempt: usize) -> Duration {
+    #[cfg(test)]
+    {
+        let _ = failed_attempt;
+        Duration::from_millis(1)
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(if failed_attempt <= 1 { 1 } else { 3 })
+    }
+}
+
+async fn wait_for_retry<C>(delay: Duration, checkpoint: &mut C) -> Result<()>
+where
+    C: FnMut() -> Result<()>,
+{
+    let deadline = Instant::now() + delay;
+    loop {
+        checkpoint()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(250))).await;
     }
 }
 
@@ -240,6 +356,7 @@ fn materialize_layout(
     layout: PdfPageLayout,
     source: &PdfPageSource,
     reused: bool,
+    attempts: usize,
 ) -> Result<ComposedPdfPage> {
     let lines = source
         .lines
@@ -310,6 +427,7 @@ fn materialize_layout(
         html,
         figures,
         reused,
+        attempts,
     })
 }
 
@@ -407,6 +525,71 @@ printf 'done\n'
         assert_eq!(
             fs::read_to_string(temp.path().join("page-0001/calls.txt")).unwrap(),
             "x"
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_transient_agent_failures_without_user_intervention() {
+        let temp = TempDir::new().unwrap();
+        let agent_script = temp.path().join("flaky-page-agent.sh");
+        fs::write(
+            &agent_script,
+            r#"#!/bin/sh
+set -eu
+cat >/dev/null
+attempt=0
+if [ -f attempts.txt ]; then
+  attempt=$(cat attempts.txt)
+fi
+attempt=$((attempt + 1))
+printf '%s' "$attempt" > attempts.txt
+if [ "$attempt" -lt 3 ]; then
+  printf 'ERROR: Selected model is at capacity. Please try a different model.\n' >&2
+  exit 1
+fi
+mkdir -p output
+cat > output/page.json <<'JSON'
+{"page":1,"blocks":[{"kind":"paragraph","lineIds":["l0001"]}],"omittedLineIds":[]}
+JSON
+printf 'done\n'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&agent_script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&agent_script, permissions).unwrap();
+        let database = Arc::new(Database::open(&temp.path().join("Data")).unwrap());
+        let runtime = database
+            .save_custom_agent_runtime("临时失败 Agent", agent_script.to_str().unwrap(), &[])
+            .unwrap();
+        let agent =
+            Arc::new(AgentCoordinator::new(temp.path().join("AgentTasks"), database).unwrap());
+        let composer = PdfPageComposer::new(agent);
+        let image = temp.path().join("page.png");
+        fs::write(&image, b"page image fixture").unwrap();
+        let workspace = temp.path().join("workspace");
+        let source = PdfPageSource {
+            page: 1,
+            image_path: image,
+            image_width: 800,
+            image_height: 1200,
+            requires_figure: false,
+            lines: vec![PdfSourceLine {
+                id: "l0001".to_string(),
+                text: "需要可靠生成的正文".to_string(),
+                removable: false,
+            }],
+        };
+
+        let result = composer
+            .compose(&runtime.id, &workspace, &source)
+            .await
+            .unwrap();
+
+        assert!(result.html.contains("需要可靠生成的正文"));
+        assert_eq!(
+            fs::read_to_string(workspace.join("attempts.txt")).unwrap(),
+            "3"
         );
     }
 

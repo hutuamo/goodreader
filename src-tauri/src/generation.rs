@@ -13,7 +13,10 @@ use tokio::sync::Semaphore;
 use url::Url;
 use uuid::Uuid;
 
-use crate::agent::AgentCoordinator;
+use crate::agent::{
+    classify_agent_failure, transient_agent_retry_delay, AgentCoordinator, AgentFailureClass,
+    TranslationRun, MAX_TRANSIENT_AGENT_ATTEMPTS,
+};
 use crate::importer::import_html_directory;
 use crate::library::{resolve_package_file, validate_package};
 use crate::models::{
@@ -795,7 +798,7 @@ impl ImportManager {
                 },
             )?;
             let composed = composer
-                .compose(
+                .compose_with_retry(
                     runtime_id,
                     &workspace,
                     &PdfPageSource {
@@ -806,6 +809,44 @@ impl ImportManager {
                         requires_figure: image_pages.contains(&page),
                         lines,
                     },
+                    |retry| {
+                        let delay_seconds = retry.delay_ms.saturating_add(999) / 1_000;
+                        self.append_event_with_context(
+                            task_id,
+                            "agent",
+                            &format!(
+                                "PDF 第 {page} 页自动重试 {}/{}",
+                                retry.next_attempt, retry.max_attempts
+                            ),
+                            &format!(
+                                "第 {} 次执行失败：{}\n将在 {delay_seconds} 秒后自动重试",
+                                retry.failed_attempt,
+                                truncate_event_detail(&retry.reason, 2_000)
+                            ),
+                            EventContext {
+                                scope: Some(format!("pdf.page.{page}")),
+                                state: Some("retrying".to_string()),
+                                progress: Some(ImportTaskEventProgress {
+                                    completed,
+                                    total: total_pages,
+                                    unit: "pages".to_string(),
+                                }),
+                                timing: Some(ImportTaskEventTiming {
+                                    started_at: Utc::now().timestamp_millis(),
+                                    elapsed_ms: 0,
+                                    eta_ms: Some(retry.delay_ms),
+                                }),
+                                runtime: Some(ImportTaskEventRuntime {
+                                    id: runtime_id.to_string(),
+                                    model: None,
+                                    session_id: None,
+                                    pid: None,
+                                }),
+                                metrics: None,
+                            },
+                        )
+                    },
+                    || self.checkpoint(task_id),
                 )
                 .await?;
             let mut html = composed.html;
@@ -837,6 +878,7 @@ impl ImportManager {
                 total_pages,
                 page,
                 composed.reused,
+                composed.attempts,
             )?;
         }
 
@@ -1235,18 +1277,24 @@ impl ImportManager {
         total_batches: usize,
     ) -> Result<TranslationBatchExecution> {
         let run = self
-            .agent
-            .run_translation(runtime_id, batch_root, batch, &preflight.language)
+            .run_translation_with_retry(
+                task_id,
+                runtime_id,
+                batch_root,
+                batch,
+                &preflight.language,
+                &format!("{batch_number}/{total_batches}"),
+            )
             .await;
         match run {
-            Ok(run) => match validate_translation_map(batch, &run.translations) {
+            Ok((run, attempts)) => match validate_translation_map(batch, &run.translations) {
                 Ok(()) => Ok(TranslationBatchExecution {
                     translations: run.translations,
                     answer: run.answer,
                     session_id: run.session_id,
                     model: run.model,
                     elapsed_ms: run.elapsed_ms,
-                    attempts: 1,
+                    attempts,
                 }),
                 Err(error) => {
                     self.retry_split_translation_batch(
@@ -1258,6 +1306,7 @@ impl ImportManager {
                         batch_number,
                         total_batches,
                         error,
+                        attempts,
                     )
                     .await
                 }
@@ -1272,6 +1321,7 @@ impl ImportManager {
                     batch_number,
                     total_batches,
                     error,
+                    1,
                 )
                 .await
             }
@@ -1279,6 +1329,75 @@ impl ImportManager {
                 Err(error).with_context(|| format!("翻译批次 {batch_number}/{total_batches} 失败"))
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_translation_with_retry(
+        &self,
+        task_id: &str,
+        runtime_id: &str,
+        workspace: &Path,
+        batch: &BTreeMap<String, String>,
+        source_language: &str,
+        scope_title: &str,
+    ) -> Result<(TranslationRun, usize)> {
+        let started = std::time::Instant::now();
+        for attempt in 1..=MAX_TRANSIENT_AGENT_ATTEMPTS {
+            self.checkpoint(task_id)?;
+            match self
+                .agent
+                .run_translation(runtime_id, workspace, batch, source_language)
+                .await
+            {
+                Ok(mut run) => {
+                    run.elapsed_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    return Ok((run, attempt));
+                }
+                Err(error)
+                    if !should_split_translation_error(&error)
+                        && classify_agent_failure(&error) == AgentFailureClass::Transient
+                        && attempt < MAX_TRANSIENT_AGENT_ATTEMPTS =>
+                {
+                    let delay = transient_agent_retry_delay(attempt);
+                    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                    let delay_seconds = delay_ms.saturating_add(999) / 1_000;
+                    self.append_event_with_context(
+                        task_id,
+                        "agent",
+                        &format!(
+                            "翻译批次 {scope_title} 自动重试 {}/{}",
+                            attempt + 1,
+                            MAX_TRANSIENT_AGENT_ATTEMPTS
+                        ),
+                        &format!(
+                            "第 {attempt} 次执行遇到临时故障：{}\n将在 {delay_seconds} 秒后自动重试",
+                            truncate_event_detail(&format!("{error:#}"), 2_000)
+                        ),
+                        EventContext {
+                            scope: Some(format!("translation.batch.{scope_title}")),
+                            state: Some("retrying".to_string()),
+                            progress: None,
+                            timing: Some(ImportTaskEventTiming {
+                                started_at: Utc::now().timestamp_millis(),
+                                elapsed_ms: 0,
+                                eta_ms: Some(delay_ms),
+                            }),
+                            runtime: Some(ImportTaskEventRuntime {
+                                id: runtime_id.to_string(),
+                                model: None,
+                                session_id: None,
+                                pid: None,
+                            }),
+                            metrics: None,
+                        },
+                    )?;
+                    self.wait_retry_delay(task_id, delay).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("翻译重试循环必须返回结果")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1292,6 +1411,7 @@ impl ImportManager {
         batch_number: usize,
         total_batches: usize,
         initial_error: anyhow::Error,
+        initial_attempts: usize,
     ) -> Result<TranslationBatchExecution> {
         let (left, right) = split_translation_batch(batch);
         if right.is_empty() {
@@ -1308,14 +1428,28 @@ impl ImportManager {
         let right_root = batch_root.join("retry-part-2");
         prepare_retry_workspace(&left_root, &left)?;
         prepare_retry_workspace(&right_root, &right)?;
+        let left_scope = format!("{batch_number}/{total_batches} · 前半");
+        let right_scope = format!("{batch_number}/{total_batches} · 后半");
         let (left_result, right_result) = tokio::join!(
-            self.agent
-                .run_translation(runtime_id, &left_root, &left, &preflight.language),
-            self.agent
-                .run_translation(runtime_id, &right_root, &right, &preflight.language)
+            self.run_translation_with_retry(
+                task_id,
+                runtime_id,
+                &left_root,
+                &left,
+                &preflight.language,
+                &left_scope,
+            ),
+            self.run_translation_with_retry(
+                task_id,
+                runtime_id,
+                &right_root,
+                &right,
+                &preflight.language,
+                &right_scope,
+            )
         );
-        let left_result = left_result.context("拆分后的前半批次翻译失败")?;
-        let right_result = right_result.context("拆分后的后半批次翻译失败")?;
+        let (left_result, left_attempts) = left_result.context("拆分后的前半批次翻译失败")?;
+        let (right_result, right_attempts) = right_result.context("拆分后的后半批次翻译失败")?;
         validate_translation_map(&left, &left_result.translations)?;
         validate_translation_map(&right, &right_result.translations)?;
         let mut translations = left_result.translations;
@@ -1330,7 +1464,9 @@ impl ImportManager {
             elapsed_ms: left_result
                 .elapsed_ms
                 .saturating_add(right_result.elapsed_ms),
-            attempts: 3,
+            attempts: initial_attempts
+                .saturating_add(left_attempts)
+                .saturating_add(right_attempts),
         })
     }
 
@@ -1406,6 +1542,7 @@ impl ImportManager {
         total_pages: usize,
         page: usize,
         reused: bool,
+        attempts: usize,
     ) -> Result<()> {
         let mut task = self.load_task(task_id)?;
         let progress = 18
@@ -1419,6 +1556,15 @@ impl ImportManager {
             None,
         );
         self.save_task(&task)?;
+        let detail = if reused {
+            "页面结构与图片区域已通过校验，复用上次检查点".to_string()
+        } else if attempts > 1 {
+            format!(
+                "经过 {attempts} 次执行后，Agent 页面结构与图片区域已通过 GoodReader 完整性校验"
+            )
+        } else {
+            "Agent 页面结构与图片区域已通过 GoodReader 完整性校验".to_string()
+        };
         self.append_event(
             task_id,
             "agent",
@@ -1426,11 +1572,7 @@ impl ImportManager {
                 "{} PDF 第 {page} 页（{completed_pages}/{total_pages}）",
                 if reused { "恢复" } else { "Agent 完成" }
             ),
-            if reused {
-                "页面结构与图片区域已通过校验，复用上次检查点"
-            } else {
-                "Agent 页面结构与图片区域已通过 GoodReader 完整性校验"
-            },
+            &detail,
         )
     }
 
@@ -1895,6 +2037,23 @@ impl ImportManager {
             bail!("任务已暂停");
         }
         Ok(())
+    }
+
+    async fn wait_retry_delay(&self, id: &str, delay: std::time::Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            self.checkpoint(id)?;
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            tokio::time::sleep(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(std::time::Duration::from_millis(250)),
+            )
+            .await;
+        }
     }
 
     fn cleanup_task_outputs(&self, id: &str) -> Result<()> {
@@ -4208,10 +4367,32 @@ mod tests {
         )
         .unwrap();
 
+        let calls = temp.path().join("translation-agent-calls.txt");
         let fake_agent = temp.path().join("fake-agent.sh");
         fs::write(
             &fake_agent,
-            "#!/bin/sh\nmkdir -p output\nsed 's/English/中文/g; s/Chapter One/第一章/g; s/This/这段/g; s/paragraph/正文/g' input/blocks.json > output/translations.json\ncat >/dev/null\nprintf 'done\\n'\n",
+            format!(
+                r#"#!/bin/sh
+set -eu
+cat >/dev/null
+calls=0
+if [ -f '{}' ]; then
+  calls=$(cat '{}')
+fi
+calls=$((calls + 1))
+printf '%s' "$calls" > '{}'
+if [ "$calls" -lt 3 ]; then
+  echo 'Selected model is at capacity' >&2
+  exit 3
+fi
+mkdir -p output
+sed 's/English/中文/g; s/Chapter One/第一章/g; s/This/这段/g; s/paragraph/正文/g' input/blocks.json > output/translations.json
+printf 'done\n'
+"#,
+                calls.display(),
+                calls.display(),
+                calls.display(),
+            ),
         )
         .unwrap();
         let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
@@ -4273,7 +4454,7 @@ mod tests {
         let events = manager.events(&task.id).unwrap();
         let agent_event = events
             .iter()
-            .find(|event| event.kind == "agent")
+            .find(|event| event.kind == "agent" && event.state.as_deref() == Some("completed"))
             .expect("应记录 Agent 返回内容");
         assert!(agent_event.detail.contains("done"));
         assert!(agent_event.seq > 0);
@@ -4285,6 +4466,19 @@ mod tests {
             .timing
             .as_ref()
             .is_some_and(|timing| timing.elapsed_ms > 0));
+        assert_eq!(fs::read_to_string(calls).unwrap(), "3");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.state.as_deref() == Some("retrying"))
+                .count(),
+            2,
+            "两次容量不足必须自动重试，不得要求用户恢复任务"
+        );
+        assert_eq!(
+            agent_event.metrics.as_ref().map(|metrics| metrics.attempt),
+            Some(3)
+        );
     }
 
     #[tokio::test]

@@ -33,6 +33,9 @@ if (!source.includes("afterSeq=") || !source.includes("importTaskEventCache")) {
 if (!source.includes("importTaskDetailsSummary") || !source.includes("预计剩余")) {
   throw new Error("生成详情缺少正文块、耗时和 ETA 摘要");
 }
+if (!source.includes('event.state === "retrying"') || !source.includes('items.push("自动重试")')) {
+  throw new Error("生成详情没有向用户标识后台自动重试状态");
+}
 if (!source.includes('name="pdfMode" value="auto"')
   || !source.includes('name="pdfMode" value="text-layer"')
   || !source.includes('name="pdfMode" value="ocr"')) {

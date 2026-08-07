@@ -1072,6 +1072,7 @@ function importTaskEventMetadata(event: ImportTaskEvent): string {
   if (event.runtime?.sessionId) items.push(`会话 ${event.runtime.sessionId.slice(0, 12)}`);
   if (event.runtime?.model) items.push(`模型 ${event.runtime.model}`);
   if (event.state === "running") items.push("运行中");
+  if (event.state === "retrying") items.push("自动重试");
   return items.map(escapeHtml).join(" · ");
 }
 

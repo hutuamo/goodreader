@@ -29,6 +29,91 @@ const EXECUTION_TIMEOUT: Duration = Duration::from_secs(60 * 30);
 const NETWORK_FAILURE_TIMEOUT: Duration = Duration::from_secs(90);
 const TRANSLATION_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60 * 8);
 const MAX_INVALID_STRUCTURED_OUTPUTS: usize = 2;
+pub(crate) const MAX_TRANSIENT_AGENT_ATTEMPTS: usize = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentFailureClass {
+    Transient,
+    Permanent,
+    Unknown,
+}
+
+pub(crate) fn classify_agent_failure(error: &anyhow::Error) -> AgentFailureClass {
+    let detail = format!("{error:#}").to_ascii_lowercase();
+    let permanent = [
+        "找不到可执行文件",
+        "无法启动 agent 运行时",
+        "需要登录",
+        "not logged in",
+        "please login",
+        "please log in",
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "invalid api key",
+        "permission denied",
+        "额度不足",
+        "余额不足",
+        "insufficient quota",
+        "billing",
+        "credit balance",
+        "usage limit",
+    ];
+    if permanent.iter().any(|needle| detail.contains(needle)) {
+        return AgentFailureClass::Permanent;
+    }
+    let transient = [
+        "at capacity",
+        "overloaded",
+        "rate limit",
+        "too many requests",
+        "status code: 429",
+        "status code: 500",
+        "status code: 502",
+        "status code: 503",
+        "status code: 504",
+        "网络连接",
+        "network",
+        "tls handshake",
+        "stream disconnected",
+        "error sending request",
+        "timed out",
+        "timeout",
+        "超时",
+        "超过 30 分钟",
+        "超过 8 分钟",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "unexpected eof",
+        "temporarily unavailable",
+        "service unavailable",
+        "没有返回回答",
+        "没有返回翻译结果",
+    ];
+    if transient.iter().any(|needle| detail.contains(needle)) {
+        AgentFailureClass::Transient
+    } else {
+        AgentFailureClass::Unknown
+    }
+}
+
+pub(crate) fn transient_agent_retry_delay(failed_attempt: usize) -> Duration {
+    #[cfg(test)]
+    {
+        let _ = failed_attempt;
+        Duration::from_millis(1)
+    }
+    #[cfg(not(test))]
+    {
+        const DELAYS: [u64; 5] = [5, 15, 30, 60, 120];
+        Duration::from_secs(
+            DELAYS[failed_attempt
+                .saturating_sub(1)
+                .min(DELAYS.len().saturating_sub(1))],
+        )
+    }
+}
 
 #[derive(Clone)]
 pub struct AgentCoordinator {
@@ -1638,10 +1723,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        chapter_markdown, custom_runtime_spec, execute_claude_translation_command, execute_command,
-        execute_command_with_limits, filter_claude_translation_event,
-        parse_claude_translation_stream, run_runtime_instruction, terminate_process_group,
-        truncate, AgentCoordinator,
+        chapter_markdown, classify_agent_failure, custom_runtime_spec,
+        execute_claude_translation_command, execute_command, execute_command_with_limits,
+        filter_claude_translation_event, parse_claude_translation_stream, run_runtime_instruction,
+        terminate_process_group, truncate, AgentCoordinator, AgentFailureClass,
     };
     use crate::db::Database;
     use crate::models::CustomAgentRuntime;
@@ -1664,6 +1749,30 @@ mod tests {
     #[test]
     fn truncates_diagnostic_text_by_character() {
         assert_eq!(truncate("中文错误详情", 4), "中文错误");
+    }
+
+    #[test]
+    fn classifies_agent_failures_for_unattended_retry() {
+        assert_eq!(
+            classify_agent_failure(&anyhow::anyhow!("Selected model is at capacity")),
+            AgentFailureClass::Transient
+        );
+        assert_eq!(
+            classify_agent_failure(&anyhow::anyhow!("Agent 网络连接持续失败超过 90 秒")),
+            AgentFailureClass::Transient
+        );
+        assert_eq!(
+            classify_agent_failure(&anyhow::anyhow!("Agent 没有返回回答")),
+            AgentFailureClass::Transient
+        );
+        assert_eq!(
+            classify_agent_failure(&anyhow::anyhow!("authentication failed: please login")),
+            AgentFailureClass::Permanent
+        );
+        assert_eq!(
+            classify_agent_failure(&anyhow::anyhow!("本地章节文件不存在")),
+            AgentFailureClass::Unknown
+        );
     }
 
     #[tokio::test]
