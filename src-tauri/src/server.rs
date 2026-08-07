@@ -1310,6 +1310,17 @@ fn save_cover_override(root: &Path, book_id: &str, source: &Path) -> Result<()> 
     let bytes = fs::read(source).context("无法读取封面图片")?;
     let format =
         cover_image_format(&bytes).context("仅支持 PNG、JPEG、GIF 或 WebP 格式的封面图片")?;
+    // 只读图像头取尺寸（不解码像素，避免巨幅声明尺寸触发内存暴涨），拒绝每边
+    // 超过上限的封面，防止 WebView 解码时冻结。
+    const MAX_COVER_DIMENSION: u32 = 8192;
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .with_context(|| "无法识别封面图片格式")?
+        .into_dimensions()
+        .with_context(|| "无法读取封面图片尺寸")?;
+    if dimensions.0 > MAX_COVER_DIMENSION || dimensions.1 > MAX_COVER_DIMENSION {
+        bail!("封面图片像素过大（每边最多 {MAX_COVER_DIMENSION} 像素）");
+    }
     fs::create_dir_all(root).context("无法创建封面覆盖目录")?;
     let temporary = root.join(format!("{book_id}.tmp"));
     fs::write(&temporary, bytes).context("无法暂存新封面")?;
