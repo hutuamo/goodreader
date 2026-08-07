@@ -2143,12 +2143,15 @@ fn render_pdf_region(
 }
 
 fn png_dimensions(path: &Path) -> Result<(usize, usize)> {
-    let bytes = fs::read(path).context("无法读取 PDF 页面图像")?;
-    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+    // 只读 PNG 头 24 字节取尺寸，避免把整张页面图像读进内存。
+    let mut file = fs::File::open(path).context("无法读取 PDF 页面图像")?;
+    let mut header = [0u8; 24];
+    file.read_exact(&mut header).context("PDF 页面渲染结果不是有效 PNG")?;
+    if &header[..8] != b"\x89PNG\r\n\x1a\n" {
         bail!("PDF 页面渲染结果不是有效 PNG");
     }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().expect("PNG 宽度字节"));
-    let height = u32::from_be_bytes(bytes[20..24].try_into().expect("PNG 高度字节"));
+    let width = u32::from_be_bytes(header[16..20].try_into().expect("PNG 宽度字节"));
+    let height = u32::from_be_bytes(header[20..24].try_into().expect("PNG 高度字节"));
     Ok((width as usize, height as usize))
 }
 
