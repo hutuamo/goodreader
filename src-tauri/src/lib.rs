@@ -19,6 +19,14 @@ pub fn run() {
     let shutdown_for_exit = shutdown.clone();
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // 已有实例运行时，把现有窗口拉回前台，而不是再启动一个进程并发写同一数据库。
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(move |app| {
             let data_dir = if let Some(path) = std::env::var_os("GOODREADER_DATA_DIR") {
                 std::path::PathBuf::from(path)
