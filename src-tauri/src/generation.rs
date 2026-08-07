@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
+use parking_lot::Mutex;
 use url::Url;
 use uuid::Uuid;
 
@@ -190,7 +191,7 @@ impl ImportManager {
     }
 
     pub fn start(self: &Arc<Self>, request: StartImportRequest) -> Result<ImportTaskSummary> {
-        let _start_guard = self.start_lock.lock().expect("创建导入任务锁");
+        let _start_guard = self.start_lock.lock();
         if let Some(task) = self
             .list_tasks()?
             .into_iter()
@@ -294,7 +295,6 @@ impl ImportManager {
     pub fn pause(&self, id: &str) -> Result<ImportTaskSummary> {
         self.paused
             .lock()
-            .expect("暂停任务锁")
             .insert(id.to_string());
         self.agent.cancel_generations_under(&self.root.join(id));
         let mut task = self.load_task(id)?;
@@ -324,8 +324,8 @@ impl ImportManager {
         if task.summary.status != "paused" && task.summary.status != "failed" {
             bail!("只有暂停或失败的任务可以继续");
         }
-        self.paused.lock().expect("暂停任务锁").remove(id);
-        self.cancelled.lock().expect("取消任务锁").remove(id);
+        self.paused.lock().remove(id);
+        self.cancelled.lock().remove(id);
         if let Some(runtime_id) = runtime_id.map(str::trim).filter(|value| !value.is_empty()) {
             let preflight = self.load_preflight(&task.request.token)?;
             if !task.request.translate && preflight.preflight.kind != ImportSourceKind::Pdf {
@@ -386,7 +386,6 @@ impl ImportManager {
     pub fn cancel(&self, id: &str) -> Result<ImportTaskSummary> {
         self.cancelled
             .lock()
-            .expect("取消任务锁")
             .insert(id.to_string());
         self.agent.cancel_generations_under(&self.root.join(id));
         let mut task = self.load_task(id)?;
@@ -1734,7 +1733,7 @@ impl ImportManager {
         context: EventContext,
     ) -> Result<()> {
         validate_id(id)?;
-        let _event_guard = self.event_lock.lock().expect("生成详情事件锁");
+        let _event_guard = self.event_lock.lock();
         let seq = self
             .load_events(id)?
             .into_iter()
@@ -1892,15 +1891,15 @@ impl ImportManager {
     }
 
     fn should_stop(&self, id: &str) -> bool {
-        self.cancelled.lock().expect("取消任务锁").contains(id)
-            || self.paused.lock().expect("暂停任务锁").contains(id)
+        self.cancelled.lock().contains(id)
+            || self.paused.lock().contains(id)
     }
 
     fn checkpoint(&self, id: &str) -> Result<()> {
-        if self.cancelled.lock().expect("取消任务锁").contains(id) {
+        if self.cancelled.lock().contains(id) {
             bail!("任务已取消");
         }
-        if self.paused.lock().expect("暂停任务锁").contains(id) {
+        if self.paused.lock().contains(id) {
             bail!("任务已暂停");
         }
         Ok(())
@@ -4828,7 +4827,7 @@ printf 'done\n'
         use std::io::{ErrorKind, Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Mutex;
+        use parking_lot::Mutex;
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -4853,7 +4852,7 @@ printf 'done\n'
                 let request = String::from_utf8_lossy(&request[..length]);
                 let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
                 let count = {
-                    let mut counts = server_counts.lock().unwrap();
+                    let mut counts = server_counts.lock();
                     let count = counts.entry(path.clone()).or_insert(0);
                     *count += 1;
                     *count
@@ -4968,7 +4967,6 @@ printf 'done\n'
         assert_eq!(
             request_counts
                 .lock()
-                .unwrap()
                 .get("/book/ch1.html")
                 .copied(),
             Some(1)
@@ -4988,7 +4986,7 @@ printf 'done\n'
         server.join().unwrap();
         let completed = completed.expect("恢复后的在线任务应结束");
         assert_eq!(completed.status, "completed", "{:?}", completed.error);
-        let counts = request_counts.lock().unwrap();
+        let counts = request_counts.lock();
         assert_eq!(counts.get("/book/ch1.html").copied(), Some(1));
         assert_eq!(counts.get("/book/ch2.html").copied(), Some(2));
     }

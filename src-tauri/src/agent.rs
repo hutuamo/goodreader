@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -14,6 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::process::Command;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
+use parking_lot::Mutex;
 
 use crate::agent_session::{
     terminate_process_group, AgentSessionHost, ExecutionControl, ProviderExecutionEvent,
@@ -158,7 +159,7 @@ impl AgentCoordinator {
             .map(|task| task.id)
             .collect::<Vec<_>>();
         {
-            let controls = self.active_questions.lock().expect("Agent 问题控制锁");
+            let controls = self.active_questions.lock();
             for task_id in &task_ids {
                 if let Some(control) = controls.get(task_id) {
                     control.cancel();
@@ -412,7 +413,7 @@ impl AgentCoordinator {
     }
 
     pub fn cancel_generations_under(&self, root: &Path) {
-        let processes = self.active_processes.lock().expect("Agent 活动进程锁");
+        let processes = self.active_processes.lock();
         for (workspace, pid) in processes.iter() {
             if workspace.starts_with(root) {
                 terminate_process_group(*pid);
@@ -440,9 +441,8 @@ impl AgentCoordinator {
         let control = ExecutionControl::new();
         self.active_questions
             .lock()
-            .expect("Agent 问题控制锁")
             .insert(task.id.clone(), control.clone());
-        self.live_tasks.lock().expect("Agent 实时状态锁").insert(
+        self.live_tasks.lock().insert(
             task.id.clone(),
             LiveTaskState {
                 phase: Some("等待 Agent 启动".to_string()),
@@ -477,12 +477,10 @@ impl AgentCoordinator {
             coordinator
                 .active_questions
                 .lock()
-                .expect("Agent 问题控制锁")
                 .remove(&task.id);
             coordinator
                 .live_tasks
                 .lock()
-                .expect("Agent 实时状态锁")
                 .remove(&task.id);
             coordinator.publish_task(&task.id);
         });
@@ -494,7 +492,7 @@ impl AgentCoordinator {
         // 原生会话（Codex/Claude/OpenCode）把子进程 pid 登记在 ExecutionControl，
         // 优先用它杀进程组；这些进程从不进入 active_processes。
         let native_pid = {
-            let controls = self.active_questions.lock().expect("Agent 问题控制锁");
+            let controls = self.active_questions.lock();
             if let Some(control) = controls.get(task_id) {
                 control.cancel();
                 control.pid()
@@ -511,7 +509,6 @@ impl AgentCoordinator {
             if let Some(pid) = self
                 .active_processes
                 .lock()
-                .expect("Agent 活动进程锁")
                 .get(&workspace)
                 .copied()
             {
@@ -526,7 +523,6 @@ impl AgentCoordinator {
         if let Some(live) = self
             .live_tasks
             .lock()
-            .expect("Agent 实时状态锁")
             .get(&task.id)
             .cloned()
         {
@@ -591,7 +587,6 @@ impl AgentCoordinator {
                 if let Some(live) = self
                     .live_tasks
                     .lock()
-                    .expect("Agent 实时状态锁")
                     .get_mut(&task.id)
                 {
                     live.partial_output = output.answer.clone();
@@ -662,7 +657,7 @@ impl AgentCoordinator {
             .sessions
             .execute(config, instruction.to_string(), control.clone());
         {
-            let mut tasks = self.live_tasks.lock().expect("Agent 实时状态锁");
+            let mut tasks = self.live_tasks.lock();
             if let Some(live) = tasks.get_mut(&task.id) {
                 live.execution_id = Some(run.execution_id.clone());
                 live.turn_id = Some(run.turn_id.clone());
@@ -670,7 +665,6 @@ impl AgentCoordinator {
         }
         self.active_questions
             .lock()
-            .expect("Agent 问题控制锁")
             .insert(task.id.clone(), run.control());
         self.publish_task(&task.id);
         while let Some(event) = run.events.recv().await {
@@ -680,7 +674,7 @@ impl AgentCoordinator {
                 let _ = events_file.flush();
             }
             {
-                let mut tasks = self.live_tasks.lock().expect("Agent 实时状态锁");
+                let mut tasks = self.live_tasks.lock();
                 if let Some(live) = tasks.get_mut(&task.id) {
                     live.stream_sequence = event.scope().sequence;
                     match &event {
@@ -859,7 +853,7 @@ impl AgentCoordinator {
     }
 
     fn question_lock(&self, book_id: &str) -> Arc<AsyncMutex<()>> {
-        let mut locks = self.question_locks.lock().expect("Agent 问题书锁");
+        let mut locks = self.question_locks.lock();
         locks
             .entry(book_id.to_string())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
@@ -1118,7 +1112,6 @@ async fn execute_command_with_limits(
     if let Some(processes) = active_processes {
         processes
             .lock()
-            .expect("Agent 活动进程锁")
             .insert(workspace.to_path_buf(), pid);
     }
     if let Some(logs) = live_logs {
@@ -1227,7 +1220,6 @@ async fn execute_claude_translation_command(
     let pid = child.id().context("无法取得 Agent 进程标识")?;
     active_processes
         .lock()
-        .expect("Agent 活动进程锁")
         .insert(workspace.to_path_buf(), pid);
     fs::create_dir_all(logs)?;
     fs::write(logs.join("process.pid"), pid.to_string())?;
@@ -1529,7 +1521,6 @@ fn finish_process_tracking(
     if let Some(processes) = active_processes {
         processes
             .lock()
-            .expect("Agent 活动进程锁")
             .remove(workspace);
     }
     if let Some(logs) = live_logs {
@@ -1671,7 +1662,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use parking_lot::Mutex;
     use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
@@ -1918,7 +1910,7 @@ sleep 0.3
 
         let pid = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(pid) = active.lock().unwrap().get(&workspace).copied() {
+                if let Some(pid) = active.lock().get(&workspace).copied() {
                     break pid;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1933,7 +1925,7 @@ sleep 0.3
             .expect("停止后进程应及时退出")
             .expect("执行任务");
         assert!(result.is_err());
-        assert!(active.lock().unwrap().is_empty());
+        assert!(active.lock().is_empty());
     }
 
     #[test]

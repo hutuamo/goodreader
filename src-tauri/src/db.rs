@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Local, Utc};
+use parking_lot::Mutex;
 use rusqlite::backup::Backup;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
@@ -142,7 +142,7 @@ impl Database {
     }
 
     fn initialize(&self) -> Result<()> {
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > SCHEMA_VERSION {
             bail!("数据库版本 {version} 高于应用支持的 {SCHEMA_VERSION}");
@@ -164,7 +164,7 @@ impl Database {
     }
 
     pub fn all_progress(&self) -> Result<Vec<Progress>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT book_id, chapter_id, block_id, chapter_progress, overall_progress, updated_at
              FROM progress",
@@ -175,7 +175,7 @@ impl Database {
     }
 
     pub fn progress(&self, book_id: &str) -> Result<Option<Progress>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection
             .query_row(
                 "SELECT book_id, chapter_id, block_id, chapter_progress, overall_progress, updated_at
@@ -197,7 +197,7 @@ impl Database {
             bail!("章节 ID 不能为空");
         }
         let now = Utc::now().timestamp_millis();
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection.execute(
             r#"
             INSERT INTO progress(
@@ -230,7 +230,7 @@ impl Database {
     }
 
     pub fn annotations(&self, book_id: &str) -> Result<Vec<Annotation>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let mut statement = connection.prepare(
             r#"
             SELECT id, book_id, chapter_id, block_id, start_offset, end_offset, quote,
@@ -247,7 +247,7 @@ impl Database {
 
     pub fn create_annotation(&self, book_id: &str, input: &CreateAnnotation) -> Result<Annotation> {
         validate_annotation(input)?;
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
 
         let exact = connection
             .query_row(
@@ -343,7 +343,7 @@ impl Database {
             bail!("笔记内容不能为空");
         }
         let now = Utc::now().timestamp_millis();
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let changed = connection.execute(
             "UPDATE annotations SET note = ?1, updated_at = ?2
              WHERE id = ?3 AND kind = 'note'",
@@ -366,12 +366,12 @@ impl Database {
     }
 
     pub fn delete_annotation(&self, annotation_id: &str) -> Result<bool> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         Ok(connection.execute("DELETE FROM annotations WHERE id = ?1", [annotation_id])? > 0)
     }
 
     pub fn forget_book(&self, book_id: &str) -> Result<(usize, usize)> {
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let progress = transaction.execute("DELETE FROM progress WHERE book_id = ?1", [book_id])?;
         let annotations =
@@ -383,7 +383,7 @@ impl Database {
     }
 
     pub fn clear_ai_workspace(&self, book_id: &str) -> Result<usize> {
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let removed =
             transaction.execute("DELETE FROM agent_tasks WHERE book_id = ?1", [book_id])?;
@@ -393,7 +393,7 @@ impl Database {
     }
 
     pub fn agent_session(&self, book_id: &str, runtime_id: &str) -> Result<Option<AgentSession>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection
             .query_row(
                 "SELECT book_id, runtime_id, provider_session_id, provider_state_json, updated_at
@@ -421,7 +421,7 @@ impl Database {
         provider_state_json: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp_millis();
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection.execute(
             "INSERT INTO agent_sessions(
                 book_id, runtime_id, provider_session_id, provider_state_json, updated_at
@@ -457,7 +457,7 @@ impl Database {
         let now = Utc::now().timestamp_millis();
         let task_id = Uuid::new_v4().to_string();
         let message_id = Uuid::new_v4().to_string();
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         transaction
             .execute(
@@ -486,7 +486,7 @@ impl Database {
     }
 
     pub fn agent_task(&self, task_id: &str) -> Result<Option<AgentTask>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection
             .query_row(
                 "SELECT id, book_id, kind, status, goal, current_runtime_id, error,
@@ -500,7 +500,7 @@ impl Database {
     }
 
     pub fn active_agent_tasks(&self, book_id: &str) -> Result<Vec<AgentTask>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT id, book_id, kind, status, goal, current_runtime_id, error,
                     created_at, updated_at
@@ -514,7 +514,7 @@ impl Database {
     }
 
     pub fn ai_messages(&self, book_id: &str) -> Result<Vec<AiMessage>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT messages.id, messages.book_id, messages.task_id, messages.role,
                     messages.content, messages.runtime_id, messages.created_at,
@@ -536,7 +536,7 @@ impl Database {
     pub fn start_agent_execution(&self, task_id: &str, runtime_id: &str) -> Result<String> {
         let now = Utc::now().timestamp_millis();
         let execution_id = Uuid::new_v4().to_string();
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
             "UPDATE agent_tasks
@@ -570,7 +570,7 @@ impl Database {
         }
         let now = Utc::now().timestamp_millis();
         let message_id = Uuid::new_v4().to_string();
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
             "UPDATE agent_tasks SET status = 'completed', error = NULL, updated_at = ?1
@@ -606,7 +606,7 @@ impl Database {
         error: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp_millis();
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         if let Some(execution_id) = execution_id {
             transaction.execute(
@@ -627,7 +627,7 @@ impl Database {
 
     pub fn stop_agent_task(&self, task_id: &str) -> Result<AgentTask> {
         let now = Utc::now().timestamp_millis();
-        let mut connection = self.connection.lock().expect("数据库互斥锁");
+        let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         transaction.execute(
             "UPDATE agent_executions
@@ -653,7 +653,7 @@ impl Database {
 
     pub fn retry_agent_task(&self, task_id: &str, runtime_id: &str) -> Result<AgentTask> {
         let now = Utc::now().timestamp_millis();
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let changed = connection.execute(
             "UPDATE agent_tasks
              SET status = 'queued', current_runtime_id = ?1, error = NULL, updated_at = ?2
@@ -688,7 +688,7 @@ impl Database {
         let id = format!("custom-{}", Uuid::new_v4());
         let now = Utc::now().timestamp_millis();
         let arguments_json = serde_json::to_string(arguments)?;
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection.execute(
             "INSERT INTO agent_runtimes(id, name, executable, arguments_json, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -703,7 +703,7 @@ impl Database {
     }
 
     pub fn custom_agent_runtimes(&self) -> Result<Vec<CustomAgentRuntime>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT id, name, executable, arguments_json
              FROM agent_runtimes ORDER BY created_at ASC",
@@ -723,12 +723,12 @@ impl Database {
     }
 
     pub fn delete_custom_agent_runtime(&self, runtime_id: &str) -> Result<bool> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         Ok(connection.execute("DELETE FROM agent_runtimes WHERE id = ?1", [runtime_id])? > 0)
     }
 
     pub fn annotation_count(&self, book_id: &str) -> Result<usize> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         let count: i64 = connection.query_row(
             "SELECT COUNT(*) FROM annotations WHERE book_id = ?1",
             [book_id],
@@ -738,7 +738,7 @@ impl Database {
     }
 
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection
             .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
                 row.get(0)
@@ -748,7 +748,7 @@ impl Database {
     }
 
     pub fn save_setting(&self, key: &str, value: &str) -> Result<()> {
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection.execute(
             "INSERT INTO settings(key, value) VALUES(?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -761,7 +761,7 @@ impl Database {
         let timestamp = Local::now().format("%Y%m%d-%H%M%S");
         let name = format!("{kind}-{timestamp}.sqlite3");
         let path = self.backups_dir.join(&name);
-        let source = self.connection.lock().expect("数据库互斥锁");
+        let source = self.connection.lock();
         let mut destination =
             Connection::open(&path).with_context(|| format!("无法创建备份 {}", path.display()))?;
         let backup = Backup::new(&source, &mut destination)?;
@@ -776,7 +776,7 @@ impl Database {
     pub fn ensure_daily_backup(&self) -> Result<()> {
         let today = Local::now().format("%Y-%m-%d").to_string();
         {
-            let connection = self.connection.lock().expect("数据库互斥锁");
+            let connection = self.connection.lock();
             let last: Option<String> = connection
                 .query_row(
                     "SELECT value FROM settings WHERE key = 'last_auto_backup_date'",
@@ -789,7 +789,7 @@ impl Database {
             }
         }
         self.create_backup("auto")?;
-        let connection = self.connection.lock().expect("数据库互斥锁");
+        let connection = self.connection.lock();
         connection.execute(
             "INSERT INTO settings(key, value) VALUES('last_auto_backup_date', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -831,7 +831,7 @@ impl Database {
         }
 
         self.create_backup("before-restore")?;
-        let mut destination = self.connection.lock().expect("数据库互斥锁");
+        let mut destination = self.connection.lock();
         let backup = Backup::new(&source, &mut destination)?;
         backup.run_to_completion(64, Duration::from_millis(20), None)?;
         drop(backup);
