@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent_session::{
     terminate_process_group, AgentSessionHost, ExecutionControl, ProviderExecutionEvent,
@@ -37,6 +38,7 @@ pub struct AgentCoordinator {
     active_processes: Arc<Mutex<HashMap<PathBuf, u32>>>,
     active_questions: Arc<Mutex<HashMap<String, ExecutionControl>>>,
     live_tasks: Arc<Mutex<HashMap<String, LiveTaskState>>>,
+    question_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     sessions: AgentSessionHost,
     task_updates: broadcast::Sender<AgentTaskStreamEvent>,
 }
@@ -134,6 +136,7 @@ impl AgentCoordinator {
             active_processes: Arc::new(Mutex::new(HashMap::new())),
             active_questions: Arc::new(Mutex::new(HashMap::new())),
             live_tasks: Arc::new(Mutex::new(HashMap::new())),
+            question_locks: Arc::new(Mutex::new(HashMap::new())),
             sessions: AgentSessionHost::new(),
             task_updates,
         })
@@ -537,6 +540,11 @@ impl AgentCoordinator {
         task: &AgentTask,
         control: &ExecutionControl,
     ) -> Result<()> {
+        // 同一本书的问答串行执行：prepare_workspace 覆盖同一个按 book_id 定位
+        // 的工作区，若不互斥，并发问题（含不同运行时）会把对方的 context/current.md
+        // 与 history 覆写成自己的问题。
+        let book_lock = self.question_lock(&task.book_id);
+        let _book_guard = book_lock.lock().await;
         let runtime = self.runtime_spec(&task.current_runtime_id)?;
         let execution_id = self.database.start_agent_execution(&task.id, &runtime.id)?;
 
@@ -826,6 +834,14 @@ impl AgentCoordinator {
             .join("Sessions")
             .join(session_directory)
             .join("workspace")
+    }
+
+    fn question_lock(&self, book_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.question_locks.lock().expect("Agent 问题书锁");
+        locks
+            .entry(book_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 }
 

@@ -144,6 +144,9 @@ impl Database {
                 PRIMARY KEY(book_id, runtime_id)
             );
 
+            CREATE UNIQUE INDEX IF NOT EXISTS agent_tasks_one_active_per_book
+                ON agent_tasks(book_id) WHERE status NOT IN ('completed', 'stopped');
+
             PRAGMA user_version = 3;
             "#,
         )?;
@@ -446,12 +449,20 @@ impl Database {
         let message_id = Uuid::new_v4().to_string();
         let mut connection = self.connection.lock().expect("数据库互斥锁");
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO agent_tasks(
-                id, book_id, kind, status, goal, current_runtime_id, error, created_at, updated_at
-             ) VALUES (?1, ?2, 'question', 'queued', ?3, ?4, NULL, ?5, ?5)",
-            params![task_id, book_id, goal, runtime_id, now],
-        )?;
+        transaction
+            .execute(
+                "INSERT INTO agent_tasks(
+                    id, book_id, kind, status, goal, current_runtime_id, error, created_at, updated_at
+                 ) VALUES (?1, ?2, 'question', 'queued', ?3, ?4, NULL, ?5, ?5)",
+                params![task_id, book_id, goal, runtime_id, now],
+            )
+            .map_err(|error| {
+                if error.to_string().contains("UNIQUE constraint") {
+                    anyhow!("这本书已有正在运行的 AI 请求，请先等待完成或停止当前请求")
+                } else {
+                    anyhow::Error::from(error)
+                }
+            })?;
         transaction.execute(
             "INSERT INTO ai_messages(
                 id, book_id, task_id, role, content, runtime_id, created_at
@@ -1202,6 +1213,22 @@ mod tests {
         assert!(
             error.to_string().contains("更高版本"),
             "未报告更高版本：{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_second_active_question_task_for_the_same_book() {
+        let temp = TempDir::new().expect("临时目录");
+        let database = Database::open(temp.path()).expect("打开数据库");
+        database
+            .create_question_task("book", "codex", "第一个问题")
+            .expect("创建第一个任务");
+        let error = database
+            .create_question_task("book", "codex", "第二个问题")
+            .expect_err("同一本书的第二个活跃任务必须被拒绝");
+        assert!(
+            error.to_string().contains("已有正在运行"),
+            "未报告已有运行任务：{error}"
         );
     }
 }
